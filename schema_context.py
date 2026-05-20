@@ -21,8 +21,13 @@
 # ─────────────────────────────────────────────
 
 # Columns to silently drop from every query result before returning to frontend.
-# These are raw NetSuite amounts already captured in more useful derived columns
-# (billing_amount, collection_amount, open_amount) and add noise to the output.
+# transaction_amount is the raw NetSuite field — each table has a proper metric
+# column that should be used instead:
+#   billing     → billing_amount  (= transaction_amount, but semantically clear)
+#   collections → collection_amount
+#   ar          → open_amount
+# These are excluded from results to avoid confusion; calculations should
+# always use the domain-specific metric column, never transaction_amount.
 COLUMNS_TO_EXCLUDE: set[str] = {
     "transaction_amount",
     "transaction_amount_paid",
@@ -619,6 +624,14 @@ AGEING BUCKET DEFINITIONS (derive via CASE WHEN on open_days):
   91-180 days: open_days BETWEEN 91 AND 180
   >180 days : open_days > 180
 
+COLUMNS THAT DO NOT EXIST IN ar — NEVER use these in FROM ar queries:
+  subscriptionfee, implementationfee, integrationfee, studiofee,
+  otherservicesfee, openingsplitfee, amsfee   → billing table only
+  billing_amount, transaction_exchange_rate    → billing table only
+  collection_amount, ageingbucket, tds_flag   → collections table only
+  If user asks about subscription revenue, implementation revenue etc.
+  while AR context is active → route to billing table, not ar.
+
 SELECT * for ar returns these columns (in this order):
   transaction_id, transaction_number, transaction_type, transaction_currency_id,
   transaction_date, duedate, transaction_amount, transaction_amount_paid,
@@ -627,4 +640,69 @@ SELECT * for ar returns these columns (in this order):
   ucc_parent, entity_id, region, country, client_journey_stage, client_buckets,
   collection_status, subsidiary_id, subsidiary_name, paying_entity,
   currency_symbol, inter_company_status, open_days, open_amount
+"""
+
+
+# ─────────────────────────────────────────────
+# UNIFIED CONTEXT  (billing + collections joined)
+# View: finance_unified_txn
+# ─────────────────────────────────────────────
+
+PERCENTAGE_FORMAT_RULE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERCENTAGE FORMAT RULE (applies to ALL queries):
+  Always return percentage/ratio columns as DECIMAL RATIOS (0 to 1).
+  e.g. 74.8% contribution → return 0.748, NOT 74.8 or 74.82
+  The frontend handles × 100 and % symbol formatting.
+  This applies to: pct_change, pct_difference, row_pct, contribution_pct,
+  percentage, overdue_pct, collection_efficiency, and any column ending
+  in _pct or _ratio or containing % in its name.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
+UNIFIED_CONTEXT = """
+VIEW: finance_unified_txn
+Pre-aggregated billing + collections joined at customer_ucc + fy_quarter level.
+One row per customer per quarter per inter_company_status.
+
+DIMENSIONS:
+  customer_ucc, customer_name, region, subsidiary_name,
+  client_buckets, client_journey_stage, collection_status,
+  fy_quarter, inter_company_status
+
+BILLING METRICS (USD):
+  billed_usd           → total billing incl. tax
+  billed_excl_tax_usd  → billing excl. tax
+  tax_usd              → tax amount
+  subscription_usd, implementation_usd, integration_usd,
+  studio_usd, other_services_usd  → fee type splits
+
+BILLING METRICS (INR):
+  billed_inr, billed_excl_tax_inr, tax_inr,
+  subscription_inr, implementation_inr, integration_inr,
+  studio_inr, other_services_inr
+
+COLLECTIONS METRICS (USD):
+  collected_gross_usd  → total collected incl. TDS
+  collected_net_usd    → net collected (TDS excluded)
+  tds_usd              → TDS amount only
+
+COLLECTIONS METRICS (INR):
+  collected_gross_inr, collected_net_inr, tds_inr
+
+DERIVED METRICS:
+  collection_efficiency_usd  → collected_net_usd / billed_excl_tax_usd
+                               (1.0 = 100% collected; >1.0 = overcollected)
+  invoice_count              → distinct invoice count from billing
+  payment_count              → distinct payment count from collections
+
+DEFAULT FILTERS:
+  inter_company_status = 'F'  (external customers only)
+  For intercompany: inter_company_status = 'T'
+
+FY FILTER: fy_quarter LIKE 'FY26%'
+  (same LIKE pattern as billing/collections)
+
+CURRENCY: use _usd or _inr suffix columns based on requested currency.
+  No exchange rate multiplication needed — already pre-converted in the view.
 """

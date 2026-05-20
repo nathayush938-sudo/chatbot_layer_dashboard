@@ -8,16 +8,22 @@ from sqlalchemy import create_engine, text
 from datetime import date
 import pandas as pd
 import os
+import re
+import json
+import time
 
 from schema_context import (
     BILLING_CONTEXT,
     COLLECTIONS_CONTEXT,
     AR_CONTEXT,
+    UNIFIED_CONTEXT,
     PRESENTATION_RULES,
     STRICT_METRIC_SELECTION_RULES,
     COLUMN_DISPLAY_NAMES,
+    COLUMNS_TO_EXCLUDE,
+    CUSTOMER_DIMENSION_COLUMNS,
 )
-from semantic_model import BILLING_SEMANTIC_MODEL, COLLECTIONS_SEMANTIC_MODEL, AR_SEMANTIC_MODEL
+from semantic_model import BILLING_SEMANTIC_MODEL, COLLECTIONS_SEMANTIC_MODEL, AR_SEMANTIC_MODEL, UNIFIED_SEMANTIC_MODEL
 
 app = FastAPI()
 
@@ -111,7 +117,141 @@ def get_fy_info() -> dict:
 
 class ChatRequest(BaseModel):
     message: str
-    history: list = []   # list of {"user": str, "assistant": str} dicts
+    history: list = []
+    preferred_currency: str = "USD"   # USD or INR — set by sidebar toggle
+
+
+class FilterRequest(BaseModel):
+    filter_text: str        # natural language filter phrase
+    original_sql: str       # SQL that produced the current result
+    domain: str             # billing / collections / ar
+    columns: list = []      # column names in the current result
+
+
+# ─────────────────────────────────────────────
+# FILTER ENDPOINT
+# ─────────────────────────────────────────────
+
+@app.post("/filter")
+async def filter_result(request: FilterRequest):
+    """
+    Takes a natural language filter phrase + the original SQL,
+    asks Claude to rewrite the SQL with the filter applied,
+    runs the new SQL and returns the result.
+    """
+    fy     = get_fy_info()
+    schema = (BILLING_CONTEXT if request.domain == "billing"
+              else COLLECTIONS_CONTEXT if request.domain == "collections"
+              else UNIFIED_CONTEXT if request.domain == "unified"
+              else AR_CONTEXT)
+
+    prompt = f"""You are a SQL filter assistant for a finance analytics tool.
+
+The user is looking at a query result and wants to filter it further.
+
+ORIGINAL SQL:
+{request.original_sql}
+
+CURRENT COLUMNS IN RESULT:
+{', '.join(request.columns)}
+
+DOMAIN CONTEXT (column names and values):
+{schema}
+
+FY CONTEXT: current_fy={fy['current_fy']}, previous_fy={fy['previous_fy']}
+
+USER FILTER REQUEST:
+"{request.filter_text}"
+
+TASK:
+Rewrite the original SQL to apply the user's filter. Rules:
+1. Only modify WHERE / HAVING clauses — keep SELECT, FROM, GROUP BY, ORDER BY unchanged.
+2. For row-level filters on dimensions (region, client_buckets etc.) → add to WHERE.
+3. For filters on aggregated metrics (e.g. "greater than 1M") → add HAVING clause.
+4. For "top N" / "bottom N" → add or replace ORDER BY + LIMIT.
+5. Use exact stored values from the domain context when the user specifies an exact known value (e.g. 'Issue', 'Non-Issue', 'DB India'). For broad geographic/partial matches like "India", "APAC", "South" use LIKE with wildcards: region LIKE '%India%' NOT region = 'India', since region values are compound (e.g. 'India - North', 'India - South', 'India - West', 'India - Growth A').
+6. Interpret natural language amounts: 1M=1000000, 1Cr=10000000, 1K=1000.
+7. PostgreSQL syntax only. DOUBLE CHECK all SQL keywords are spelled correctly.
+8. CRITICAL: Never use 'country' — the column is 'region'. Never use 'GROPY BY' — it must be 'GROUP BY'.
+9. LIKE patterns use single %, never double %% (e.g. LIKE 'FY26%' not LIKE 'FY26%%').
+10. Return ONLY valid JSON, no markdown, no explanation.
+
+Return this exact JSON structure:
+{{
+  "sql": "<rewritten SQL>",
+  "description": "<one-line human description of what was filtered, e.g. 'Filtered to Issue accounts with outstanding > $1M'>"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+
+        # Strip markdown fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+
+        sql         = parsed.get("sql", "").strip()
+        description = parsed.get("description", "")
+
+        # ── Sanitise common Claude SQL typos ────────────────────────────────
+        TYPO_FIXES = [
+            (r"\bGROPY\s+BY\b",    "GROUP BY"),
+            (r"\bGROUP\s+B\b",     "GROUP BY"),
+            (r"\bFROM\s+FORM\b",   "FROM"),
+            (r"\bWHERE\s+WERE\b",  "WHERE"),
+            (r"\bHAVING\s+HAVNG\b","HAVING"),
+            (r"LIKE\s+'([^']*?)%%", r"LIKE '\1%"),   # double % in LIKE
+            (r"\bcountry\b",       "region"),         # wrong column name
+            # region = 'India' → region LIKE '%India%' (partial region names)
+            (r"region\s*=\s*'(India[^']*)'",
+             r"region LIKE '%\1%'"),
+        ]
+        for pattern, replacement in TYPO_FIXES:
+            sql = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
+
+        # Safety check — SELECT only
+        sql_upper = sql.upper().strip()
+        if not sql_upper.startswith("SELECT"):
+            raise HTTPException(status_code=400, detail="Filter produced non-SELECT SQL")
+        for forbidden in ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
+                          "TRUNCATE", "CREATE"]:
+            if re.search(rf"\b{forbidden}\b", sql_upper):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Filter SQL contains forbidden keyword: {forbidden}"
+                )
+
+        # Run the filtered SQL
+        with engine.connect() as conn:
+            df = pd.read_sql_query(text(sql), conn)
+
+        # Post-process
+        df = df.astype(object).where(pd.notnull(df), other=None)
+        cols_to_drop = [c for c in df.columns if c in COLUMNS_TO_EXCLUDE]
+        if cols_to_drop:
+            df = df.drop(columns=cols_to_drop)
+
+        customer_dims = [c for c in df.columns if c in CUSTOMER_DIMENSION_COLUMNS]
+        if customer_dims and len(df) > 1 and "customer_name" in df.columns:
+            df = df[df["customer_name"].notna()]
+
+        return {
+            "sql":         sql,
+            "description": description,
+            "data":        df.to_dict(orient="records"),
+            "columns":     list(df.columns),
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500,
+                            detail="Claude returned invalid JSON for filter")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 TOOLS = [
@@ -217,18 +357,29 @@ COLLECTION_KEYWORDS = [
 
 BILLING_KEYWORDS = [
     # "billing" alone is a strong billing signal AFTER neutral phrase stripping.
-    # "billing entity" / "billing subsidiary" are stripped before scoring so
-    # "collections for billing entity us" correctly scores zero here.
     "billing", "bill",
     "invoice", "invoices", "invoiced",
     "billed", "billed revenue", "billed amount",
     "invoice type", "invoice split", "revenue split",
-    "subscription revenue", "implementation revenue",
-    "integration revenue", "studio revenue",
-    "subscriptionfee", "implementationfee",
-    "integrationfee", "studiofee", "amsfee",
+    # Fee type columns — ONLY exist in billing, never in ar or collections
+    "subscription revenue", "subscription fee", "subscriptionfee",
+    "implementation revenue", "implementation fee", "implementationfee",
+    "integration revenue", "integration fee", "integrationfee",
+    "studio revenue", "studio fee", "studiofee",
+    "other services", "otherservicesfee", "amsfee", "openingsplitfee",
     "credit note",
 ]
+
+# These keywords are so strongly billing-specific that they override
+# conversation history regardless of prior domain
+BILLING_OVERRIDE_KEYWORDS = {
+    "subscription revenue", "subscription fee", "subscriptionfee",
+    "implementation revenue", "implementation fee", "implementationfee",
+    "integration revenue", "integration fee", "integrationfee",
+    "studio revenue", "studio fee", "studiofee",
+    "amsfee", "openingsplitfee", "otherservicesfee",
+    "invoice type", "invoice split", "revenue split",
+}
 
 # Terms that appear in ALL domains — strip before scoring so they don't skew routing
 NEUTRAL_PHRASES = [
@@ -236,15 +387,32 @@ NEUTRAL_PHRASES = [
     "subsidiary", "paying entity", "billed entity",
 ]
 
+UNIFIED_KEYWORDS = [
+    "billing and collections", "billing vs collections", "billed vs collected",
+    "billing versus collections", "collection efficiency", "collection rate",
+    "recovery rate", "billed but not collected", "billing collection gap",
+    "billing compared to collections", "collections against billing",
+    "how much was collected vs billed", "collected vs billed",
+    "finance_unified", "unified",
+]
+
 
 def classify_domain(message: str, history: list = []) -> str:
     """
-    Returns 'ar', 'collections', or 'billing' based on keyword scoring.
+    Returns 'ar', 'collections', 'billing', or 'unified' based on keyword scoring.
     Neutral phrases are stripped first so "billing entity" doesn't score as billing.
     Falls back to last domain in history ONLY when score is truly zero across all domains.
     Defaults to 'billing' when no signal exists anywhere.
     """
     msg = message.lower()
+
+    # Unified domain — cross-domain queries (billing + collections)
+    if any(kw in msg for kw in UNIFIED_KEYWORDS):
+        return "unified"
+
+    # Hard override — fee-type columns only exist in billing, ignore history entirely
+    if any(kw in msg for kw in BILLING_OVERRIDE_KEYWORDS):
+        return "billing"
 
     # Strip neutral phrases before scoring
     for phrase in NEUTRAL_PHRASES:
@@ -271,8 +439,14 @@ def classify_domain(message: str, history: list = []) -> str:
     return "billing"
 
 
-def build_system_prompt(domain: str) -> str:
-    fy = get_fy_info()
+def build_system_prompt(domain: str, preferred_currency: str = "USD") -> str:
+    fy  = get_fy_info()
+    cur = preferred_currency.upper()
+    currency_instruction = (
+        f"\nUSER CURRENCY PREFERENCE: {cur}. "
+        f"Use {'inr_exchangerate' if cur == 'INR' else 'usd_exchangerate'} "
+        f"for all amount calculations. Set display.currency = \"{cur}\".\n"
+    )
 
     date_and_time_rules = f"""
 Financial Year Context (computed at runtime):
@@ -366,7 +540,7 @@ Use the following table/view context:
 {COLLECTIONS_SEMANTIC_MODEL}
 
 {date_and_time_rules}
-
+{currency_instruction}
 Core Rules:
 - Generate PostgreSQL queries only.
 - Only SELECT statements are allowed.
@@ -415,6 +589,40 @@ Display Rules:
 """
 
     # Default: billing
+    if domain == "unified":
+        return f"""
+You are a finance analytics assistant with access to a unified billing + collections view.
+
+Use the following table/view context:
+
+{UNIFIED_CONTEXT}
+
+{PRESENTATION_RULES}
+
+{STRICT_METRIC_SELECTION_RULES}
+
+{UNIFIED_SEMANTIC_MODEL}
+
+{date_and_time_rules}
+{currency_instruction}
+Core Rules:
+- Generate PostgreSQL queries only. SELECT only.
+- Table name: finance_unified_txn
+- No exchange rate multiplication — amounts are pre-converted in the view.
+- Use _usd or _inr column suffixes based on requested currency.
+- Default currency: USD. Default to _usd columns unless user asks for INR.
+- Default filter: inter_company_status = 'F'
+- FY filter uses fy_quarter column (not transaction_fy_quarter).
+- For collection efficiency, use collection_efficiency_usd (decimal ratio).
+- Do not use markdown. Use the provided tool for structured output.
+
+Display Rules:
+- display.title should reflect both billing and collections context.
+- display.currency should match the selected reporting currency.
+- display.columns should map SQL aliases to clean display names.
+- collection_efficiency_usd → format as percentage (decimal ratio).
+"""
+
     return f"""
 You are a finance analytics assistant.
 
@@ -429,7 +637,7 @@ Use the following table/view context:
 {BILLING_SEMANTIC_MODEL}
 
 {date_and_time_rules}
-
+{currency_instruction}
 Core Rules:
 - Generate PostgreSQL queries only.
 - Only SELECT statements are allowed.
@@ -514,7 +722,7 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail="DATABASE_URL is not loaded")
 
     domain = classify_domain(request.message, request.history)
-    system_prompt = build_system_prompt(domain)
+    system_prompt = build_system_prompt(domain, request.preferred_currency)
 
     import time
 
@@ -581,6 +789,14 @@ def chat(request: ChatRequest):
         # Build a plain-text assistant summary for conversation history storage
         display  = parsed.get("display", {})
         display  = fill_display_columns(display, list(df.columns))
+
+        # Apply domain-based currency default if Claude didn't set one
+        # Collections → INR by default; all others → USD
+        if not display.get("currency"):
+            display["currency"] = "INR" if domain == "collections" else "USD"
+        elif display.get("currency", "").upper() not in ("USD", "INR"):
+            display["currency"] = "INR" if domain == "collections" else "USD"
+
         parsed["display"] = display
         assistant_summary = (
             f"Report generated: {display.get('title', 'Untitled')}\n"

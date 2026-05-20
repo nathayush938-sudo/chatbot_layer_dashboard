@@ -63,13 +63,16 @@ def get_fy_info() -> dict:
 # NUMBER FORMATTING
 # ─────────────────────────────────────────────
 
-def fmt(value, currency="USD", decimals=2):
-    """Format a number with dynamic denomination (Bn/Mn/K for USD, Cr/L/K for INR)."""
+def fmt(value, currency="USD", decimals=2, raw=False):
+    """Format a number with dynamic denomination (Bn/Mn/K for USD, Cr/L/K for INR).
+    raw=True: show full unformatted number without symbol or abbreviation."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "—"
-    x      = float(value)
-    abs_x  = abs(x)
-    sym    = "₹" if currency == "INR" else "$"
+    x     = float(value)
+    abs_x = abs(x)
+    if raw or (currency or "").upper() == "RAW":
+        return f"{x:,.2f}"
+    sym = "₹" if currency == "INR" else "$"
     if currency == "INR":
         if abs_x >= 10_000_000: return f"{sym}{x/10_000_000:,.{decimals}f} Cr"
         if abs_x >= 100_000:    return f"{sym}{x/100_000:,.{decimals}f} L"
@@ -107,13 +110,7 @@ def fmt_delta(current, previous):
 # ─────────────────────────────────────────────
 
 def render_kpi_card(title: str, value, previous=None,
-                    currency="USD", vs_label="vs prior year"):
-    """
-    Renders a single KPI metric card with:
-      - Title
-      - Large formatted value
-      - Optional % delta vs prior period with colour
-    """
+                    currency="USD", vs_label="vs prior year", raw=False):
     delta_str, delta_color = ("—", "gray")
     if previous is not None:
         delta_str, delta_color = fmt_delta(float(value), float(previous))
@@ -122,18 +119,13 @@ def render_kpi_card(title: str, value, previous=None,
     color_hex  = color_map.get(delta_color, "#9ca3af")
 
     st.markdown(f"""
-    <div style="
-        background:#ffffff;
-        border:1px solid #e5e7eb;
-        border-radius:10px;
-        padding:16px 20px;
-        height:100%;
-    ">
+    <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;
+                padding:16px 20px;height:100%;">
         <div style="font-size:12px;color:#6b7280;font-weight:500;
                     text-transform:uppercase;letter-spacing:0.05em;
                     margin-bottom:6px;">{title}</div>
         <div style="font-size:26px;font-weight:700;color:#111827;
-                    margin-bottom:4px;">{fmt(value, currency)}</div>
+                    margin-bottom:4px;">{fmt(value, currency, raw=raw)}</div>
         <div style="font-size:13px;color:{color_hex};font-weight:600;">
             {delta_str}
             <span style="color:#9ca3af;font-weight:400;"> {vs_label}</span>
@@ -181,43 +173,104 @@ def render_dashboard_table(df: pd.DataFrame, title: str,
 
 def render_bar_chart(df: pd.DataFrame, x_col: str, y_col: str,
                      title: str, currency="USD",
-                     horizontal=False, height=400):
-    """Simple bar chart for dashboard panels."""
+                     horizontal=False, height=400, raw=False):
+    """Bar chart with amount labels. Horizontal → outside end. Vertical → inside center."""
     if df.empty:
         st.info("No data.")
         return
-    sym = "₹" if currency == "INR" else "$"
-    tick_fmt = ",.0f" if False else ".2s"   # always abbreviated on charts
+    sym      = "₹" if currency == "INR" else "$"
+    tick_fmt = ",.0f" if raw else ".2s"
+    total    = df[y_col].sum()
+
     if horizontal:
-        fig = px.bar(df.sort_values(y_col, ascending=True),
-                     x=y_col, y=x_col, orientation="h",
-                     title=title, height=height,
-                     color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(xaxis=dict(tickformat=tick_fmt,
-                                     title=f"Amount ({sym})"), yaxis_title="")
+        # Outside labels — just amount (% visible on hover)
+        labels = df[y_col].apply(lambda v: fmt(v, currency)
+                                 if isinstance(v, (int, float)) and pd.notnull(v) else "")
+        sorted_df = df.sort_values(y_col, ascending=True)
+        # Scale height: 38px per bar, min 400
+        bar_height = max(400, len(df) * 38)
+        fig = px.bar(
+            sorted_df, x=y_col, y=x_col, orientation="h",
+            title=title, height=bar_height,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+            text=sorted_df[y_col].apply(
+                lambda v: f"{fmt(v, currency, raw=raw)} ({v/total*100:.1f}%)"
+                if isinstance(v, (int, float)) and pd.notnull(v) and total else ""
+            ),
+            hover_data={y_col: ":.2s"},
+        )
+        fig.update_traces(
+            textposition="outside",
+            cliponaxis=False,
+            textfont=dict(size=11),
+        )
+        # Add % to hover
+        fig.update_traces(
+            hovertemplate="%{y}<br>" +
+                          f"Amount: %{{x:{tick_fmt}}}<br>" +
+                          "Share: %{customdata[0]:.1f}%<extra></extra>",
+            customdata=[[v / total * 100] for v in sorted_df[y_col]],
+        )
+        fig.update_layout(
+            xaxis=dict(tickformat=tick_fmt, title=f"Amount ({sym})"),
+            yaxis_title="",
+            margin=dict(l=10, r=100, t=40, b=10),   # extra right margin for outside labels
+        )
     else:
-        fig = px.bar(df, x=x_col, y=y_col, title=title, height=height,
-                     color_discrete_sequence=px.colors.qualitative.Set2)
-        fig.update_layout(xaxis_title="",
-                          yaxis=dict(tickformat=tick_fmt, title=f"Amount ({sym})"))
-    fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, width='stretch', key=f"chart_{title.replace(' ','_')}")
+        # Inside labels — amount + % (vertical bars are wider)
+        def bar_label(v):
+            if not isinstance(v, (int, float)) or pd.isna(v): return ""
+            pct = v / total * 100 if total else 0
+            return f"{fmt(v, currency, raw=raw)}<br>{pct:.1f}%"
+
+        fig = px.bar(
+            df, x=x_col, y=y_col,
+            title=title, height=height,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+            text=df[y_col].apply(bar_label),
+        )
+        fig.update_traces(
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(size=11),
+        )
+        fig.update_layout(
+            xaxis_title="",
+            yaxis=dict(tickformat=tick_fmt, title=f"Amount ({sym})"),
+            margin=dict(l=10, r=10, t=40, b=10),
+            uniformtext_minsize=8,
+            uniformtext_mode="hide",
+        )
+
+    st.plotly_chart(fig, width='stretch',
+                    key=f"chart_{title.replace(' ','_')}")
 
 
 def render_line_chart(df: pd.DataFrame, x_col: str, y_cols: list,
-                      title: str, currency="USD", height=350):
+                      title: str, currency="USD", height=350, raw=False):
     """Line chart for trend panels."""
     if df.empty:
         st.info("No data.")
         return
-    sym = "₹" if currency == "INR" else "$"
+    sym      = "₹" if currency == "INR" else "$"
+    tick_fmt = ",.0f" if raw else ".2s"
     fig = px.line(df, x=x_col, y=y_cols, title=title,
                   markers=True, height=height,
                   color_discrete_sequence=px.colors.qualitative.Set2)
+
+    # Add formatted labels at each data point
+    for trace in fig.data:
+        col_name = trace.name
+        if col_name in df.columns:
+            trace.text     = [fmt(v, currency, raw=raw) for v in df[col_name]]
+            trace.mode     = "lines+markers+text"
+            trace.textposition = "top center"
+            trace.textfont = dict(size=11)
+
     fig.update_layout(
         xaxis_title="", hovermode="x unified",
-        yaxis=dict(tickformat=".2s", title=f"Amount ({sym})"),
+        yaxis=dict(tickformat=tick_fmt, title=f"Amount ({sym})"),
         legend_title="Metric",
-        margin=dict(l=10, r=10, t=40, b=10),
+        margin=dict(l=10, r=10, t=60, b=10),
     )
     st.plotly_chart(fig, width='stretch', key=f"chart_{title.replace(' ','_')}")

@@ -10,7 +10,10 @@
 # Python imports the same dict directly as a fallback for any unknown aliases.
 # ─────────────────────────────────────────────────────────────────────────────
 
-from schema_context import render_column_display_names, render_currency_filter_rule, render_dimension_values
+from schema_context import (
+    render_column_display_names, render_currency_filter_rule,
+    render_dimension_values, PERCENTAGE_FORMAT_RULE, UNIFIED_CONTEXT,
+)
 
 _DISPLAY_NAMES_BLOCK   = render_column_display_names()
 _CURRENCY_FILTER_BLOCK = render_currency_filter_rule()
@@ -26,6 +29,20 @@ BILLING_SEMANTIC_MODEL = f"""
 BILLING SEMANTIC MODEL
 Table: billing
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIMARY METRIC COLUMN: billing_amount
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERCENTAGE FORMAT RULE (applies to ALL queries):
+  Always return percentage/ratio columns as DECIMAL RATIOS (0 to 1).
+  e.g. 74.8% contribution → return 0.748, NOT 74.8 or 74.82
+  The frontend handles × 100 and % symbol formatting.
+  This applies to: pct_change, pct_difference, row_pct, contribution_pct,
+  percentage, overdue_pct, and any column ending in _pct or containing %
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Use billing_amount (not transaction_amount) for all revenue calculations.
+  For fee type splits use: subscriptionfee, implementationfee, integrationfee,
+  studiofee, otherservicesfee, openingsplitfee, amsfee.
+  transaction_amount is an alias for billing_amount — never use it directly.
 
 DEFAULT RULES:
   - Default currency: USD. Use INR only when user asks.
@@ -141,6 +158,9 @@ TIME RULES:
   - "by year"                    → GROUP BY LEFT(transaction_fy_quarter, 4) AS fy_year
   - "by quarter" / "QoQ"         → GROUP BY transaction_fy_quarter
   Use transaction_date only for custom date ranges not expressible as FY / quarter.
+  Custom date range format: WHERE transaction_date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
+  e.g. "from March to April 26" → transaction_date >= '2026-03-01' AND transaction_date <= '2026-04-26'
+  For subscription/fee revenue over a date range, use subscriptionfee column (not transaction_amount).
 
 ────────────────────────────────────────────
 TYPE SPLIT RULES:
@@ -219,6 +239,105 @@ DETAIL QUERY (customer-specific):
     FROM billing
     WHERE inter_company_status = 'F'
       AND customer_name = (SELECT customer_name FROM derived)
+
+────────────────────────────────────────────
+COMPARISON QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "how much has X increased/decreased/changed from A to B",
+  "compare X between period A and B", "growth from X to Y",
+  "what is the increase/difference between A and B"
+
+  These are NOT GROUP BY queries. Return a SINGLE ROW with:
+    - value for period A, value for period B
+    - absolute change (B - A)
+    - percentage change ((B - A) / A * 100)
+
+  SQL template (month comparison):
+    SELECT
+        SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_a>'::date)
+                 THEN <metric> * <rate> ELSE 0 END) AS period_a,
+        SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_b>'::date)
+                 THEN <metric> * <rate> ELSE 0 END) AS period_b,
+        SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_b>'::date)
+                 THEN <metric> * <rate> ELSE 0 END) -
+        SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_a>'::date)
+                 THEN <metric> * <rate> ELSE 0 END) AS absolute_change,
+        ROUND(
+            (SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_b>'::date)
+                      THEN <metric> * <rate> ELSE 0 END) -
+             SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_a>'::date)
+                      THEN <metric> * <rate> ELSE 0 END)) /
+            NULLIF(SUM(CASE WHEN DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date_a>'::date)
+                            THEN <metric> * <rate> ELSE 0 END), 0), 4
+        ) AS pct_change
+    FROM billing
+    WHERE inter_company_status = 'F'
+
+  display.columns: period_a → "<Period A>", period_b → "<Period B>",
+    absolute_change → "Absolute Change", pct_change → "% Change"
+  IMPORTANT: pct_change must be a decimal ratio (e.g. 0.748 not 74.8) — the frontend multiplies by 100.
+  visualization: "table"  (single row → renders as KPI cards)
+  For subscription fee: <metric> = subscriptionfee
+  For total billing: <metric> = billing_amount
+  For quarter comparison: use transaction_fy_quarter = '<Q>' in CASE WHEN.
+
+  ANNUAL TOTAL RULE — "annual billing", "full year total", "% of FY total":
+  The denominator must filter to the SAME FY — never sum across all FYs.
+  WRONG: SUM(billing_amount * rate)                              ← all years
+  RIGHT:  SUM(CASE WHEN transaction_fy_quarter LIKE 'FY26%'
+               THEN billing_amount * rate ELSE 0 END)            ← FY26 only
+
+────────────────────────────────────────────
+SUPERLATIVE QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "which X has highest/most/greatest/top/lowest/least Y",
+  "who has the most billing", "best performing subsidiary",
+  "which region contributes most", "top invoice type"
+
+  Return a SINGLE ROW with the dimension value + its metric.
+  Use ORDER BY metric DESC LIMIT 1 (or ASC for lowest).
+
+  Example — "which invoice type has highest contribution in Q4 FY26":
+    SELECT
+        'Subscription Revenue' AS invoice_type,
+        SUM(subscriptionfee * usd_exchangerate) AS amount
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter = 'FY26 Q4'
+    -- then UNION or use CASE approach to find the max fee type
+
+  Better pattern using a subquery:
+    SELECT invoice_type, amount FROM (
+        SELECT 'Subscription Revenue' AS invoice_type,
+               SUM(subscriptionfee * usd_exchangerate) AS amount FROM billing
+               WHERE inter_company_status='F' AND transaction_fy_quarter='FY26 Q4'
+        UNION ALL
+        SELECT 'Implementation Revenue',
+               SUM(implementationfee * usd_exchangerate) FROM billing
+               WHERE inter_company_status='F' AND transaction_fy_quarter='FY26 Q4'
+        -- ... other fee types
+    ) t ORDER BY amount DESC LIMIT 1
+
+  For dimension-based superlatives (region, subsidiary, customer):
+  ALWAYS return both amount AND pct_of_total — even when user doesn't ask for %.
+  The % gives essential context for any "which has most/highest" answer.
+
+    SELECT region,
+           SUM(billing_amount * usd_exchangerate) AS amount,
+           ROUND(SUM(billing_amount * usd_exchangerate) /
+               NULLIF((SELECT SUM(billing_amount * usd_exchangerate)
+                       FROM billing WHERE inter_company_status='F' AND ...), 0), 4
+           ) AS pct_of_total,
+        (SELECT SUM(billing_amount * <rate>)
+         FROM billing WHERE inter_company_status='F' AND ...) AS total_amount
+    FROM billing WHERE inter_company_status='F' AND ...
+    GROUP BY region ORDER BY amount DESC LIMIT 1
+
+  visualization: "table"  (single row → 4 KPI cards: dimension + amount + % of total + total)
+  display.columns: dimension → "<Dimension e.g. Region / Quarter>", amount → "<Dimension> Billing",
+    pct_of_total → "% of FY Total", total_amount → "FY Total Billing"
+  Make dimension label specific e.g. "Q4 Collections" not just "Collections"
+  pct_of_total must be a decimal ratio (0.748 not 74.8)
 
 ────────────────────────────────────────────
 SORTING & LIMIT RULES:
@@ -419,6 +538,15 @@ COLLECTIONS SEMANTIC MODEL
 Table: collections
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+PRIMARY METRIC COLUMN: collection_amount
+  Always use collection_amount (not transaction_amount) for all collection
+  calculations. transaction_amount is the payment transaction total and
+  should never be used as the collection metric.
+
+  DEFAULT CURRENCY: INR. Always use inr_exchangerate unless user explicitly
+  asks for USD. Set display.currency = "INR" for ALL collections queries
+  including detail/transaction-level queries.
+
 DEFAULT RULES:
   - Default currency: INR. Use USD only when user asks.
   - collection_amount is in transaction currency. Always convert using exchange rates.
@@ -498,6 +626,9 @@ NULL CUSTOMER RULE:
 AGEING BUCKET RULES:
 ────────────────────────────────────────────
   ageingbucket is pre-computed in the view. GROUP BY ageingbucket directly.
+  ⚠ NEVER use CASE WHEN to create individual columns per bucket.
+  ⚠ NEVER write: SUM(CASE WHEN ageingbucket = '61-90 days' THEN ...) AS col
+  Always use: GROUP BY ageingbucket — the frontend handles pivoting into columns.
   Valid values and display order:
     'Within CP' → '1-15 days' → '16-30 days' → '31-45 days' →
     '46-60 days' → '61-90 days' → '>90 days'
@@ -564,21 +695,151 @@ DETAIL QUERY (customer-specific):
       AND customer_name ILIKE '%XYZ%'
 
 ────────────────────────────────────────────
+COMPARISON QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "how much have collections grown/changed from A to B",
+  "compare collections between period A and B",
+  "difference in collections between Q1 and Q2",
+  "collections this quarter vs last quarter"
+
+  Return a SINGLE ROW — not a GROUP BY table.
+
+  SQL template (quarter comparison):
+    SELECT
+        SUM(CASE WHEN transaction_fy_quarter = '<quarter_a>'
+                 THEN collection_amount * <rate> ELSE 0 END) AS period_a,
+        SUM(CASE WHEN transaction_fy_quarter = '<quarter_b>'
+                 THEN collection_amount * <rate> ELSE 0 END) AS period_b,
+        SUM(CASE WHEN transaction_fy_quarter = '<quarter_b>'
+                 THEN collection_amount * <rate> ELSE 0 END) -
+        SUM(CASE WHEN transaction_fy_quarter = '<quarter_a>'
+                 THEN collection_amount * <rate> ELSE 0 END) AS absolute_change,
+        ROUND(
+            (SUM(CASE WHEN transaction_fy_quarter = '<quarter_b>'
+                      THEN collection_amount * <rate> ELSE 0 END) -
+             SUM(CASE WHEN transaction_fy_quarter = '<quarter_a>'
+                      THEN collection_amount * <rate> ELSE 0 END)) /
+            NULLIF(SUM(CASE WHEN transaction_fy_quarter = '<quarter_a>'
+                            THEN collection_amount * <rate> ELSE 0 END), 0), 4
+        ) AS pct_change
+    FROM collections
+    WHERE inter_company_status = 'F'
+      AND tds_flag = 'F'
+
+  For month comparison: use DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', '<date>'::date)
+  display.columns: period_a → "<Period A>", period_b → "<Period B>",
+    absolute_change → "Absolute Change", pct_change → "% Change"
+  IMPORTANT: pct_change must be a decimal ratio (e.g. 0.748 not 74.8) — the frontend multiplies by 100.
+  visualization: "table"  (single row → renders as KPI cards)
+
+  AGEING ANALYSIS PIVOT RULE:
+  "ageing analysis by quarter/region/entity" → use ageingbucket as a GROUP BY
+  dimension alongside the other dimension. NEVER filter to one specific bucket.
+  Return ALL buckets as rows or use pivot_table visualization.
+  Example: "show ageing analysis for collections in FY26 by quarter"
+    SELECT transaction_fy_quarter, ageingbucket,
+           SUM(collection_amount * inr_exchangerate) AS collection_inr
+    FROM collections
+    WHERE inter_company_status = 'F' AND tds_flag = 'F'
+      AND transaction_fy_quarter LIKE 'FY26%'
+    GROUP BY transaction_fy_quarter, ageingbucket
+  visualization: "pivot_table"
+  display.rows: ["transaction_fy_quarter"]
+  display.columns: ["ageingbucket"]
+  "annual collections", "total for the year", "full year total" always means
+  the SAME FY as the period being asked about. NEVER sum across all FYs.
+  WRONG: SUM(collection_amount * rate)                         ← all years
+  RIGHT:  SUM(CASE WHEN transaction_fy_quarter LIKE 'FY26%'
+               THEN collection_amount * rate ELSE 0 END)       ← FY26 only
+  Example — "what % of FY26 annual collections came from Q4 FY26":
+    q4  = SUM(CASE WHEN transaction_fy_quarter = 'FY26 Q4' THEN ... ELSE 0 END)
+    fy  = SUM(CASE WHEN transaction_fy_quarter LIKE 'FY26%' THEN ... ELSE 0 END)
+    pct = ROUND(q4 / NULLIF(fy, 0), 4)
+
+────────────────────────────────────────────
+SUPERLATIVE QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "which entity/region/customer collected most/least",
+  "top collecting subsidiary", "who paid the most"
+
+  Use GROUP BY + ORDER BY amount DESC LIMIT 1 for dimension superlatives.
+  ALWAYS return amount, pct_of_total AND total_amount — even when user doesn't ask.
+  The % and total give essential context for any "which has most/highest" answer.
+  Example: "which billing entity has highest collections in FY27"
+    SELECT subsidiary_name,
+           SUM(collection_amount * inr_exchangerate) AS amount,
+           ROUND(SUM(collection_amount * inr_exchangerate) /
+               NULLIF((SELECT SUM(collection_amount * inr_exchangerate)
+                       FROM collections WHERE inter_company_status='F'
+                       AND tds_flag='F' AND transaction_fy_quarter LIKE 'FY27%'), 0), 4
+           ) AS pct_of_total,
+           (SELECT SUM(collection_amount * inr_exchangerate)
+            FROM collections WHERE inter_company_status='F'
+            AND tds_flag='F' AND transaction_fy_quarter LIKE 'FY27%') AS total_amount
+    FROM collections WHERE inter_company_status='F' AND tds_flag='F'
+      AND transaction_fy_quarter LIKE 'FY27%'
+    GROUP BY subsidiary_name ORDER BY amount DESC LIMIT 1
+
+  visualization: "table"  (single row → 4 KPI cards: entity + amount + % of total + total)
+  display.columns: subsidiary_name/quarter → "<Dimension e.g. Quarter / Entity>", amount → "<Dimension> Collections",
+    pct_of_total → "% of Period Total", total_amount → "<Period> Total Collections"
+  Make amount label specific e.g. "Mar 2026 Collections" so it differs from total.
+  For "which month in Q4 had highest" — total_amount = Q4 total, pct = month/Q4:
+    SELECT DATE_TRUNC('month', transaction_date)::DATE AS month,
+           SUM(collection_amount * inr_exchangerate) AS amount,
+           ROUND(SUM(...) / NULLIF((SELECT SUM(...) WHERE ... = 'FY26 Q4'), 0), 4) AS pct_of_total,
+           (SELECT SUM(...) WHERE ... = 'FY26 Q4') AS total_amount
+    FROM collections WHERE ... AND transaction_fy_quarter = 'FY26 Q4'
+    GROUP BY month ORDER BY amount DESC LIMIT 1
+  pct_of_total must be a decimal ratio (0.748 not 74.8)
+
+────────────────────────────────────────────
+CURRENCY DENOMINATION QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "what % of collections is in USD/INR/SGD",
+  "how much comes from USD customers", "USD collections as % of total",
+  "share of SGD collections", "INR-invoiced collections"
+
+  CRITICAL: "collections in USD" = transactions WHERE currency_symbol = 'USD'
+  NOT collections converted to USD. Always convert amounts using the DEFAULT
+  exchange rate (inr_exchangerate for INR output) — both numerator AND
+  denominator — unless user explicitly asks for USD output.
+
+  Example — "what % of collections is in USD in FY26" (INR output):
+    SELECT
+        SUM(CASE WHEN currency_symbol = 'USD'
+                 THEN collection_amount * inr_exchangerate ELSE 0 END)   AS usd_collections,
+        SUM(collection_amount * inr_exchangerate)                        AS total_collections,
+        ROUND(
+            SUM(CASE WHEN currency_symbol = 'USD'
+                     THEN collection_amount * inr_exchangerate ELSE 0 END) /
+            NULLIF(SUM(collection_amount * inr_exchangerate), 0), 4
+        )                                                                AS pct_of_total
+    FROM collections
+    WHERE inter_company_status = 'F' AND tds_flag = 'F'
+      AND transaction_fy_quarter LIKE 'FY26%'
+
+  display.columns: usd_collections → "USD Collections",
+    total_collections → "Total Collections", pct_of_total → "USD % of Total"
+  visualization: "table"  (single row → KPI cards)
+  pct_of_total must be a decimal ratio (0.748 not 74.8)
+
+────────────────────────────────────────────
 SORTING & LIMIT RULES:
 ────────────────────────────────────────────
   - Do NOT add ORDER BY to SQL. Python handles all sorting.
-  - Exception: top N / bottom N → ORDER BY alias DESC/ASC + LIMIT N.
+  - Exception 1: top N / bottom N → ORDER BY alias DESC/ASC + LIMIT N.
+  - Exception 2: ageingbucket dimension → ALWAYS add ORDER BY with CASE WHEN:
+      ORDER BY CASE ageingbucket
+          WHEN 'Within CP'  THEN 1
+          WHEN '1-15 days'  THEN 2
+          WHEN '16-30 days' THEN 3
+          WHEN '31-45 days' THEN 4
+          WHEN '46-60 days' THEN 5
+          WHEN '61-90 days' THEN 6
+          WHEN '>90 days'   THEN 7
+          ELSE 8 END
   - Top N without number → default LIMIT 10.
-  - Full breakdowns → no LIMIT.
-
-────────────────────────────────────────────
-SQL OPTIMISATION RULES:
-────────────────────────────────────────────
-  - No ORDER BY unless top N. Python sorts.
-  - Never repeat SUM expressions; use SELECT aliases.
-  - All metric aliases MUST include currency suffix: _inr or _usd.
-  - Display names must NOT include currency suffix in brackets.
-  - Keep SQL minimal: SELECT, FROM, WHERE, GROUP BY only.
 
 ────────────────────────────────────────────
 COMMON DASHBOARD REPORTS:
@@ -605,6 +866,39 @@ COMMON DASHBOARD REPORTS:
            FROM collections WHERE inter_company_status='T' AND tds_flag='F'
            GROUP BY subsidiary_name, TRIM(paying_entity)
   11. Cumulative Ageing by Quarter : dimension pivot rows=transaction_fy_quarter cols=ageingbucket
+
+  Triggers: "ageing analysis by quarter", "ageing by quarter", "show ageing analysis",
+            "collections ageing analysis", "ageing breakdown by quarter",
+            "payment timing by quarter", "cumulative ageing"
+
+  ⚠ FORBIDDEN: DO NOT generate CASE WHEN statements for individual ageing buckets.
+  ⚠ FORBIDDEN: DO NOT write one column per bucket (e.g. collection_within_cp, collection_1_15).
+  The frontend pivot_table visualization turns ageingbucket rows into columns automatically.
+
+  REQUIRED SQL — exactly this pattern, no deviations:
+    SELECT
+        transaction_fy_quarter,
+        ageingbucket,
+        SUM(collection_amount * inr_exchangerate) AS collection_inr
+    FROM collections
+    WHERE inter_company_status = 'F'
+      AND tds_flag = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+    GROUP BY transaction_fy_quarter, ageingbucket
+    ORDER BY CASE ageingbucket
+        WHEN 'Within CP'  THEN 1 WHEN '1-15 days'  THEN 2
+        WHEN '16-30 days' THEN 3 WHEN '31-45 days' THEN 4
+        WHEN '46-60 days' THEN 5 WHEN '61-90 days' THEN 6
+        WHEN '>90 days'   THEN 7 ELSE 8 END
+
+  visualization: "pivot_table"
+  display.rows: ["transaction_fy_quarter"]
+  display.columns: ["ageingbucket"]
+  display.values: ["collection_inr"]
+  display.columns mapping:
+    transaction_fy_quarter → "FY Quarter"
+    ageingbucket           → "Ageing Bucket"
+    collection_inr         → "Collections"
   12. Collections Summary Table  : SELECT * with default filters (see SUMMARY TABLE above)
 
 ────────────────────────────────────────────
@@ -629,6 +923,20 @@ AR_SEMANTIC_MODEL = f"""
 AR SEMANTIC MODEL
 Table: ar
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIMARY METRIC COLUMNS: open_amount, open_days
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERCENTAGE FORMAT RULE (applies to ALL queries):
+  Always return percentage/ratio columns as DECIMAL RATIOS (0 to 1).
+  e.g. 74.8% contribution → return 0.748, NOT 74.8 or 74.82
+  The frontend handles × 100 and % symbol formatting.
+  This applies to: pct_change, pct_difference, row_pct, contribution_pct,
+  percentage, overdue_pct, and any column ending in _pct or containing %
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Always use open_amount (not transaction_amount) for outstanding calculations.
+  open_amount is signed: positive = invoice, negative = credit/payment.
+  open_days = CURRENT_DATE - COALESCE(duedate, transaction_date).
+  transaction_amount should never be used as the AR metric.
 
 DEFAULT RULES:
   - Default currency: USD. Use INR only when user asks.
@@ -821,24 +1129,44 @@ AR AGING SUMMARY REPORT:
 ────────────────────────────────────────────
 AR KPI REPORT:
 ────────────────────────────────────────────
-  Triggers: "AR KPIs", "AR overview", "AR dashboard", "show me AR summary"
-  ONE row with all key KPIs.
+  Triggers: "AR KPIs", "AR overview", "AR dashboard", "show me AR summary",
+            "pending receivables", "show pending receivables", "receivables summary",
+            "how much is outstanding", "total outstanding", "total overdue",
+            "what is our AR", "AR snapshot", "receivables overview"
+  ONE row with all key KPIs grouped by prefix:
+    total__* = overview metrics
+    bucket__* = by client bucket
+    cjs__* = by client journey stage
 
   SQL:
     SELECT
-        SUM(open_amount * usd_exchangerate) AS total_outstanding_usd,
-        SUM(CASE WHEN open_days >= 1 THEN open_amount * usd_exchangerate ELSE 0 END) AS total_overdue_usd,
-        SUM(CASE WHEN client_buckets = 'Issue'            THEN open_amount * usd_exchangerate ELSE 0 END) AS outstanding_issue_usd,
-        SUM(CASE WHEN client_buckets = 'Non-Issue'        THEN open_amount * usd_exchangerate ELSE 0 END) AS outstanding_non_issue_usd,
-        SUM(CASE WHEN client_journey_stage = 'Customer Success'  THEN open_amount * usd_exchangerate ELSE 0 END) AS outstanding_cs_usd,
-        SUM(CASE WHEN client_journey_stage = 'Implementation'    THEN open_amount * usd_exchangerate ELSE 0 END) AS outstanding_impl_usd,
-        SUM(CASE WHEN client_journey_stage = 'Potential Churn'   THEN open_amount * usd_exchangerate ELSE 0 END) AS outstanding_churn_usd
+        -- Overview
+        SUM(open_amount * usd_exchangerate)                                                        AS total__outstanding_usd,
+        SUM(CASE WHEN open_days >= 1 THEN open_amount * usd_exchangerate ELSE 0 END)              AS total__overdue_usd,
+        -- By Client Bucket
+        SUM(CASE WHEN client_buckets = 'Issue'            THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket__issue_usd,
+        SUM(CASE WHEN client_buckets = 'Non-Issue'        THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket__non_issue_usd,
+        SUM(CASE WHEN client_buckets = 'Churned Account'  THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket__churned_usd,
+        SUM(CASE WHEN client_buckets = 'Unassigned' OR client_buckets IS NULL THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket__unassigned_usd,
+        -- By Client Journey Stage
+        SUM(CASE WHEN client_journey_stage = 'Customer Success'  THEN open_amount * usd_exchangerate ELSE 0 END) AS cjs__customer_success_usd,
+        SUM(CASE WHEN client_journey_stage = 'Implementation'    THEN open_amount * usd_exchangerate ELSE 0 END) AS cjs__implementation_usd,
+        SUM(CASE WHEN client_journey_stage = 'Potential Churn'   THEN open_amount * usd_exchangerate ELSE 0 END) AS cjs__potential_churn_usd,
+        SUM(CASE WHEN client_journey_stage = 'Churned'           THEN open_amount * usd_exchangerate ELSE 0 END) AS cjs__churned_usd
     FROM ar WHERE inter_company_status = 'F'
 
-  display.columns: Total Outstanding, Total Overdue, Outstanding - Issue,
-    Outstanding - Non-Issue, Outstanding - Customer Success,
-    Outstanding - Implementation, Outstanding - Potential Churn
-  visualization = "table"  (frontend renders as KPI cards — single row, multiple metrics)
+  display.columns:
+    total__outstanding_usd      → "Total Outstanding"
+    total__overdue_usd          → "Total Overdue"
+    bucket__issue_usd           → "Outstanding — Issue"
+    bucket__non_issue_usd       → "Outstanding — Non-Issue"
+    bucket__churned_usd         → "Outstanding — Churned Account"
+    bucket__unassigned_usd      → "Outstanding — Unassigned"
+    cjs__customer_success_usd   → "Outstanding — Customer Success"
+    cjs__implementation_usd     → "Outstanding — Implementation"
+    cjs__potential_churn_usd    → "Outstanding — Potential Churn"
+    cjs__churned_usd            → "Outstanding — Churned"
+  visualization = "table"  (frontend renders as grouped KPI rows)
 
 ────────────────────────────────────────────
 DUAL-METRIC TABLE PATTERN (Outstanding + Overdue + Ratio):
@@ -922,6 +1250,78 @@ DETAIL QUERY (customer-specific):
       AND customer_name ILIKE '%XYZ%'
 
 ────────────────────────────────────────────
+COMPARISON QUERY PATTERN:
+────────────────────────────────────────────
+  AR is a real-time snapshot — comparisons are across entities or segments,
+  not time periods (use billing/collections for period-over-period).
+
+  Triggers: "diff in AR between Company A and Company B",
+  "compare outstanding for X vs Y",
+  "difference between Issue and Non-Issue AR",
+  "AR for APAC vs MENA", "how does India compare to SG"
+
+  Return a SINGLE ROW — not a GROUP BY table.
+
+  ENTITY comparison (two customers):
+    SELECT
+        SUM(CASE WHEN customer_name ILIKE '%<company_a>%'
+                 THEN open_amount * <rate> ELSE 0 END) AS entity_a,
+        SUM(CASE WHEN customer_name ILIKE '%<company_b>%'
+                 THEN open_amount * <rate> ELSE 0 END) AS entity_b,
+        SUM(CASE WHEN customer_name ILIKE '%<company_a>%'
+                 THEN open_amount * <rate> ELSE 0 END) -
+        SUM(CASE WHEN customer_name ILIKE '%<company_b>%'
+                 THEN open_amount * <rate> ELSE 0 END) AS difference
+    FROM ar
+    WHERE inter_company_status = 'F'
+
+  SEGMENT comparison (two dimension values):
+    SELECT
+        SUM(CASE WHEN <col> = '<value_a>' THEN open_amount * <rate> ELSE 0 END) AS segment_a,
+        SUM(CASE WHEN <col> = '<value_b>' THEN open_amount * <rate> ELSE 0 END) AS segment_b,
+        SUM(CASE WHEN <col> = '<value_a>' THEN open_amount * <rate> ELSE 0 END) -
+        SUM(CASE WHEN <col> = '<value_b>' THEN open_amount * <rate> ELSE 0 END) AS difference,
+        ROUND(
+            (SUM(CASE WHEN <col> = '<value_a>' THEN open_amount * <rate> ELSE 0 END) -
+             SUM(CASE WHEN <col> = '<value_b>' THEN open_amount * <rate> ELSE 0 END)) /
+            NULLIF(SUM(CASE WHEN <col> = '<value_b>' THEN open_amount * <rate> ELSE 0 END), 0), 4
+        ) AS pct_difference
+    FROM ar
+    WHERE inter_company_status = 'F'
+
+  display.columns: entity_a/segment_a → "<Label A>", entity_b/segment_b → "<Label B>",
+    difference → "Difference", pct_difference → "% Difference"
+  IMPORTANT: pct_difference must be a decimal ratio (e.g. 0.748 not 74.8) — the frontend multiplies by 100.
+  visualization: "table"  (single row → renders as KPI cards)
+  Also add overdue comparison if user mentions overdue: use open_days >= 1 in CASE WHEN.
+
+────────────────────────────────────────────
+SUPERLATIVE QUERY PATTERN:
+────────────────────────────────────────────
+  Triggers: "which customer/region/entity has most/highest/largest AR",
+  "who owes the most", "largest outstanding", "most overdue customer"
+
+  Use GROUP BY + ORDER BY DESC LIMIT 1.
+  ALWAYS return amount, pct_of_total AND total_amount — even when user doesn't ask.
+  Example: "which customer has highest outstanding AR"
+    SELECT customer_name,
+           SUM(open_amount * usd_exchangerate) AS outstanding,
+           ROUND(SUM(open_amount * usd_exchangerate) /
+               NULLIF((SELECT SUM(open_amount * usd_exchangerate)
+                       FROM ar WHERE inter_company_status='F'), 0), 4
+           ) AS pct_of_total,
+           (SELECT SUM(open_amount * usd_exchangerate)
+            FROM ar WHERE inter_company_status='F') AS total_outstanding
+    FROM ar WHERE inter_company_status='F'
+    GROUP BY customer_name ORDER BY outstanding DESC LIMIT 1
+
+  visualization: "table"  (single row → 4 KPI cards: name + outstanding + % of total + total)
+  display.columns: customer_name/dimension → "<Dimension>", outstanding → "<Dimension> Outstanding",
+    pct_of_total → "% of Total AR", total_outstanding → "Total AR Outstanding"
+  Make outstanding label specific e.g. "Efs Outstanding" so it differs from total
+  pct_of_total must be a decimal ratio (0.748 not 74.8)
+
+────────────────────────────────────────────
 SORTING & LIMIT RULES:
 ────────────────────────────────────────────
   - Do NOT add ORDER BY to SQL. Python handles all sorting.
@@ -967,4 +1367,95 @@ DISPLAY RULES:
   - display.formatting: define currency type for all amount columns.
 
 {_DISPLAY_NAMES_BLOCK}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIFIED SEMANTIC MODEL  (billing + collections)
+# ─────────────────────────────────────────────────────────────────────────────
+
+UNIFIED_SEMANTIC_MODEL = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UNIFIED SEMANTIC MODEL
+Table: finance_unified_txn
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PRIMARY METRIC COLUMNS:
+  Billing  → billed_usd / billed_inr  (no exchange rate multiplication needed)
+  Collections → collected_net_usd / collected_net_inr  (TDS excluded, default)
+  Efficiency  → collection_efficiency_usd  (decimal ratio: 0.85 = 85% collected)
+
+{PERCENTAGE_FORMAT_RULE}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCHEMA CONTEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{UNIFIED_CONTEXT}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEFAULT RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Always filter: inter_company_status = 'F' unless user asks for intercompany.
+2. FY filter: fy_quarter LIKE 'FY27%' for current FY (runtime FY context provided separately).
+3. Default currency: USD. Use _usd suffix columns. For INR use _inr suffix.
+4. No exchange rate needed — columns are pre-converted in the view.
+5. For collections, prefer collected_net_usd/inr (TDS excluded) unless user asks for gross.
+6. collection_efficiency_usd is a decimal ratio — format as percentage.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEY QUERY PATTERNS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Billing vs Collections by dimension:
+   SELECT subsidiary_name,
+          SUM(billed_usd) AS billed,
+          SUM(collected_net_usd) AS collected,
+          ROUND(SUM(collected_net_usd) / NULLIF(SUM(billed_usd), 0), 4) AS efficiency
+   FROM finance_unified_txn
+   WHERE inter_company_status = 'F' AND fy_quarter LIKE 'FY27%'
+   GROUP BY subsidiary_name ORDER BY billed DESC
+
+2. Customers with high billing but low collections (billing-collection gap):
+   SELECT customer_name,
+          SUM(billed_usd) AS billed,
+          SUM(collected_net_usd) AS collected,
+          SUM(billed_usd) - SUM(collected_net_usd) AS gap_usd,
+          ROUND(SUM(collected_net_usd) / NULLIF(SUM(billed_usd), 0), 4) AS efficiency
+   FROM finance_unified_txn
+   WHERE inter_company_status = 'F' AND fy_quarter LIKE 'FY27%'
+     AND customer_name IS NOT NULL
+   GROUP BY customer_name
+   HAVING SUM(billed_usd) > 0
+   ORDER BY gap_usd DESC LIMIT 20
+
+3. QoQ billing vs collections trend:
+   SELECT fy_quarter,
+          SUM(billed_usd) AS billed,
+          SUM(collected_net_usd) AS collected,
+          ROUND(SUM(collected_net_usd) / NULLIF(SUM(billed_usd), 0), 4) AS efficiency
+   FROM finance_unified_txn
+   WHERE inter_company_status = 'F' AND fy_quarter LIKE 'FY27%'
+   GROUP BY fy_quarter ORDER BY fy_quarter
+
+4. Fee type contribution to collections gap:
+   SELECT subsidiary_name,
+          SUM(subscription_usd) AS subscription,
+          SUM(implementation_usd) AS implementation,
+          SUM(collected_net_usd) AS collected,
+          SUM(billed_usd) AS billed
+   FROM finance_unified_txn
+   WHERE inter_company_status = 'F' AND fy_quarter LIKE 'FY27%'
+   GROUP BY subsidiary_name ORDER BY billed DESC
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISPLAY RULES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{render_column_display_names()}
+
+collection_efficiency_usd → "Collection Efficiency"  (format as %)
+billed_usd                → "Billed Revenue"
+billed_excl_tax_usd       → "Billed (Excl Tax)"
+collected_net_usd         → "Net Collections"
+collected_gross_usd       → "Gross Collections"
+gap_usd                   → "Billing-Collection Gap"
 """
