@@ -48,29 +48,8 @@ with st.spinner("Loading filters…"):
 with st.sidebar:
     st.header("Filters")
     currency = st.radio("Currency", ["USD", "INR"], horizontal=True)
+    raw_values = st.toggle("Show raw values", value=False)
     rate_col = "usd_exchangerate" if currency == "USD" else "inr_exchangerate"
-
-    st.divider()
-    st.subheader("Dimensions")
-
-    sel_region = st.multiselect(
-        "Region", opts["region"], placeholder="All regions"
-    )
-    sel_entity = st.multiselect(
-        "Billing Entity", opts["subsidiary_name"], placeholder="All entities"
-    )
-    sel_cjs = st.multiselect(
-        "Client Journey Stage", opts["client_journey_stage"], placeholder="All stages"
-    )
-    sel_bucket = st.multiselect(
-        "Client Bucket", opts["client_buckets"], placeholder="All buckets"
-    )
-    sel_status = st.multiselect(
-        "Collection Status", opts["collection_status"], placeholder="All statuses"
-    )
-    sel_currency = st.multiselect(
-        "Transaction Currency", opts["currency_symbol"], placeholder="All currencies"
-    )
 
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
@@ -102,19 +81,36 @@ def build_where(include_ic=False):
     return "WHERE " + "\n  AND ".join(clauses)
 
 
+# ─────────────────────────────────────────────
+# PAGE HEADER + DIMENSION FILTERS
+# ─────────────────────────────────────────────
+
+st.title("📈 AR Analysis")
+st.caption(f"Real-time snapshot · As of {date.today().strftime('%d %b %Y')} · "
+           f"External customers only · {currency}")
+
+with st.expander("🔽 Filters", expanded=True):
+    r1c1, r1c2, r1c3 = st.columns(3)
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r1c1:
+        sel_region   = st.multiselect("Region", opts["region"], placeholder="All regions")
+    with r1c2:
+        sel_entity   = st.multiselect("Billing Entity", opts["subsidiary_name"], placeholder="All entities")
+    with r1c3:
+        sel_cjs      = st.multiselect("Client Journey Stage", opts["client_journey_stage"], placeholder="All stages")
+    with r2c1:
+        sel_bucket   = st.multiselect("Client Bucket", opts["client_buckets"], placeholder="All buckets")
+    with r2c2:
+        sel_status   = st.multiselect("Collection Status", opts["collection_status"], placeholder="All statuses")
+    with r2c3:
+        sel_currency = st.multiselect("Transaction Currency", opts["currency_symbol"], placeholder="All currencies")
+
 dim_cache_key = (
     currency,
     tuple(sel_region), tuple(sel_entity), tuple(sel_cjs),
     tuple(sel_bucket), tuple(sel_status), tuple(sel_currency)
 )
 
-# ─────────────────────────────────────────────
-# PAGE HEADER
-# ─────────────────────────────────────────────
-
-st.title("📈 AR Analysis")
-st.caption(f"Real-time snapshot · As of {date.today().strftime('%d %b %Y')} · "
-           f"External customers only · {currency}")
 st.divider()
 
 # ─────────────────────────────────────────────
@@ -144,10 +140,10 @@ with st.spinner("Loading KPIs…"):
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     render_kpi_card("Total Outstanding", kpi["outstanding"], currency=currency,
-                    vs_label="")
+                    vs_label="", raw=raw_values)
 with c2:
     render_kpi_card("Total Overdue", kpi["overdue"], currency=currency,
-                    vs_label="")
+                    vs_label="", raw=raw_values)
 with c3:
     render_kpi_card("Current (Not Due)", kpi["current_amt"], currency=currency,
                     vs_label="")
@@ -204,12 +200,12 @@ if not bkt.empty:
                             text-transform:uppercase;letter-spacing:0.05em;
                             margin-bottom:6px;">Outstanding — {label}</div>
                 <div style="font-size:22px;font-weight:700;color:#111827;
-                            margin-bottom:4px;">{fmt(row['outstanding'], currency)}</div>
+                            margin-bottom:4px;">{fmt(row['outstanding'], currency, raw=raw_values)}</div>
                 <div style="font-size:13px;color:#6b7280;">
                     {fmt_pct(pct)} of total
                 </div>
                 <div style="font-size:12px;color:#ef4444;margin-top:4px;">
-                    Overdue: {fmt(row['overdue'], currency)}
+                    Overdue: {fmt(row['overdue'], currency, raw=raw_values)}
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -252,12 +248,12 @@ if not cjs.empty:
                             text-transform:uppercase;letter-spacing:0.05em;
                             margin-bottom:6px;">Outstanding — {label}</div>
                 <div style="font-size:22px;font-weight:700;color:#111827;
-                            margin-bottom:4px;">{fmt(row['outstanding'], currency)}</div>
+                            margin-bottom:4px;">{fmt(row['outstanding'], currency, raw=raw_values)}</div>
                 <div style="font-size:13px;color:#6b7280;">
                     {fmt_pct(pct)} of total
                 </div>
                 <div style="font-size:12px;color:#ef4444;margin-top:4px;">
-                    Overdue: {fmt(row['overdue'], currency)}
+                    Overdue: {fmt(row['overdue'], currency, raw=raw_values)}
                 </div>
             </div>
             """, unsafe_allow_html=True)
@@ -277,10 +273,10 @@ if not cjs.empty:
                                 text-transform:uppercase;letter-spacing:0.05em;
                                 margin-bottom:6px;">Outstanding — {label}</div>
                     <div style="font-size:22px;font-weight:700;color:#111827;
-                                margin-bottom:4px;">{fmt(row['outstanding'], currency)}</div>
+                                margin-bottom:4px;">{fmt(row['outstanding'], currency, raw=raw_values)}</div>
                     <div style="font-size:13px;color:#6b7280;">{fmt_pct(pct)} of total</div>
                     <div style="font-size:12px;color:#ef4444;margin-top:4px;">
-                        Overdue: {fmt(row['overdue'], currency)}
+                        Overdue: {fmt(row['overdue'], currency, raw=raw_values)}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -314,19 +310,19 @@ with st.spinner("Loading region…"):
     reg = load_by_region(rate_col, dim_cache_key)
 
 if not reg.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="region_view", label_visibility="collapsed")
     if view == "Table":
         total_r = reg["outstanding"].sum()
         reg_d   = reg.copy()
         reg_d["outstanding_pct"] = (reg_d["outstanding"] / total_r).apply(fmt_pct)
-        reg_d["outstanding"]     = reg_d["outstanding"].apply(lambda x: fmt(x, currency))
-        reg_d["overdue"]         = reg_d["overdue"].apply(lambda x: fmt(x, currency))
+        reg_d["outstanding"]     = reg_d["outstanding"].apply(lambda x: fmt(x, currency, raw=raw_values))
+        reg_d["overdue"]         = reg_d["overdue"].apply(lambda x: fmt(x, currency, raw=raw_values))
         reg_d.columns            = ["Region", "Outstanding", "Outstanding %", "Overdue"]
         st.dataframe(reg_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(reg, "region", "outstanding",
-                         "AR by Region", currency, height=350)
+                         "AR by Region", currency, height=350, raw=raw_values)
 
 st.divider()
 
@@ -353,19 +349,19 @@ with st.spinner("Loading entity…"):
     ent = load_by_entity(rate_col, dim_cache_key)
 
 if not ent.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="entity_view", label_visibility="collapsed")
     if view == "Table":
         total_e = ent["outstanding"].sum()
         ent_d   = ent.copy()
         ent_d["outstanding_pct"] = (ent_d["outstanding"] / total_e).apply(fmt_pct)
-        ent_d["outstanding"]     = ent_d["outstanding"].apply(lambda x: fmt(x, currency))
-        ent_d["overdue"]         = ent_d["overdue"].apply(lambda x: fmt(x, currency))
+        ent_d["outstanding"]     = ent_d["outstanding"].apply(lambda x: fmt(x, currency, raw=raw_values))
+        ent_d["overdue"]         = ent_d["overdue"].apply(lambda x: fmt(x, currency, raw=raw_values))
         ent_d.columns            = ["Billing Entity", "Outstanding", "Outstanding %", "Overdue"]
         st.dataframe(ent_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(ent, "subsidiary_name", "outstanding",
-                         "AR by Billing Entity", currency, height=320)
+                         "AR by Billing Entity", currency, height=320, raw=raw_values)
 
 st.divider()
 
@@ -403,7 +399,7 @@ if not age.empty:
     ).fillna(99)
     age = age.sort_values("_sort").drop(columns="_sort")
 
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="ageing_view", label_visibility="collapsed")
     if view == "Table":
         total_a = age["outstanding"].sum()
@@ -411,12 +407,12 @@ if not age.empty:
                                   "outstanding": total_a}])
         age_d   = pd.concat([age, grand], ignore_index=True)
         age_d["pct"]         = (age_d["outstanding"] / total_a).apply(fmt_pct)
-        age_d["outstanding"] = age_d["outstanding"].apply(lambda x: fmt(x, currency))
+        age_d["outstanding"] = age_d["outstanding"].apply(lambda x: fmt(x, currency, raw=raw_values))
         age_d.columns        = ["Ageing Bucket", "Outstanding", "% of Total"]
         st.dataframe(age_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(age, "ageing_bucket", "outstanding",
-                         "AR by Ageing Bucket", currency, height=350)
+                         "AR by Ageing Bucket", currency, height=350, raw=raw_values)
 
 st.divider()
 
@@ -451,8 +447,8 @@ if not top_out.empty:
     tab_t, tab_c = st.tabs(["Table", "Chart"])
     with tab_t:
         top_d = top_out.copy()
-        top_d["outstanding"] = top_d["outstanding"].apply(lambda x: fmt(x, currency))
-        top_d["overdue"]     = top_d["overdue"].apply(lambda x: fmt(x, currency))
+        top_d["outstanding"] = top_d["outstanding"].apply(lambda x: fmt(x, currency, raw=raw_values))
+        top_d["overdue"]     = top_d["overdue"].apply(lambda x: fmt(x, currency, raw=raw_values))
         top_d.columns        = ["Entity ID", "Company Name", "Outstanding", "Overdue"]
         st.dataframe(top_d, width='stretch', hide_index=True)
     with tab_c:
@@ -494,7 +490,7 @@ if not top_ov.empty:
     with tab_t2:
         top_ov_d = top_ov.copy()
         for col in ["current_amt", "overdue", "outstanding"]:
-            top_ov_d[col] = top_ov_d[col].apply(lambda x: fmt(x, currency))
+            top_ov_d[col] = top_ov_d[col].apply(lambda x: fmt(x, currency, raw=raw_values))
         top_ov_d.columns = ["Entity ID", "Company Name",
                             "Current", "Overdue", "Total Outstanding"]
         st.dataframe(top_ov_d, width='stretch', hide_index=True)

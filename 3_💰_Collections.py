@@ -59,42 +59,14 @@ with st.spinner("Loading filters…"):
 with st.sidebar:
     st.header("Filters")
 
-    selected_fy = st.selectbox(
-        "Financial Year",
-        options=[CUR_FY, PREV_FY, fy["two_years_ago_fy"]],
-        index=0,
-    )
     currency = st.radio("Currency", ["INR", "USD"], horizontal=True)
+    raw_values = st.toggle("Show raw values", value=False)
     rate_col = "inr_exchangerate" if currency == "INR" else "usd_exchangerate"
-
-    st.divider()
-    st.subheader("Dimensions")
-
-    sel_region = st.multiselect(
-        "Region", opts["region"], placeholder="All regions"
-    )
-    sel_entity = st.multiselect(
-        "Billing Entity", opts["subsidiary_name"], placeholder="All entities"
-    )
-    sel_cjs = st.multiselect(
-        "Client Journey Stage", opts["client_journey_stage"], placeholder="All stages"
-    )
-    sel_bucket = st.multiselect(
-        "Client Bucket", opts["client_buckets"], placeholder="All buckets"
-    )
-    sel_status = st.multiselect(
-        "Collection Status", opts["collection_status"], placeholder="All statuses"
-    )
-    sel_currency = st.multiselect(
-        "Transaction Currency", opts["currency_symbol"], placeholder="All currencies"
-    )
 
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
-PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
 
 # ─────────────────────────────────────────────
 # WHERE CLAUSE BUILDER
@@ -144,18 +116,42 @@ def build_dim_filters(tds="exclude", include_ic=False):
     return "WHERE " + "\n  AND ".join(clauses)
 
 
+# ─────────────────────────────────────────────
+# PAGE HEADER + DIMENSION FILTERS
+# ─────────────────────────────────────────────
+
+selected_fy = st.session_state.get("collections_fy", CUR_FY)
+PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
+
+st.title(f"💰 Collections Dashboard — {selected_fy}")
+st.caption(f"External customers only · {currency} · TDS excluded · Compared vs {PREV}")
+st.divider()
+
+with st.expander("🔽 Filters", expanded=True):
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r1c1:
+        selected_fy  = st.selectbox("Financial Year", options=[CUR_FY, PREV_FY, fy["two_years_ago_fy"]], index=0, key="collections_fy")
+    with r1c2:
+        sel_region   = st.multiselect("Region", opts["region"], placeholder="All regions")
+    with r1c3:
+        sel_entity   = st.multiselect("Billing Entity", opts["subsidiary_name"], placeholder="All entities")
+    with r1c4:
+        sel_cjs      = st.multiselect("Client Journey Stage", opts["client_journey_stage"], placeholder="All stages")
+    with r2c1:
+        sel_bucket   = st.multiselect("Client Bucket", opts["client_buckets"], placeholder="All buckets")
+    with r2c2:
+        sel_status   = st.multiselect("Collection Status", opts["collection_status"], placeholder="All statuses")
+    with r2c3:
+        sel_currency = st.multiselect("Transaction Currency", opts["currency_symbol"], placeholder="All currencies")
+
 dim_cache_key = (
     tuple(sel_region), tuple(sel_entity), tuple(sel_cjs),
     tuple(sel_bucket), tuple(sel_status), tuple(sel_currency)
 )
 
-# ─────────────────────────────────────────────
-# PAGE HEADER
-# ─────────────────────────────────────────────
+PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
 
-st.title(f"💰 Collections Dashboard — {selected_fy}")
-st.caption(f"External customers only · {currency} · TDS excluded · Compared vs {PREV}")
-st.divider()
 
 # ─────────────────────────────────────────────
 # SECTION 1 — KPI CARDS
@@ -213,7 +209,7 @@ with c2:
 with c3:
     tds_curr = (kpi["ytd_gross"] or 0) - (kpi["ytd_net"] or 0)
     tds_prev = (kpi["prev_gross"] or 0) - (kpi["prev_net"] or 0)
-    render_kpi_card("TDS Amount", tds_curr, tds_prev, currency)
+    render_kpi_card("TDS Amount", tds_curr, tds_prev, currency, raw=raw_values)
 
 st.divider()
 
@@ -239,20 +235,20 @@ with st.spinner("Loading QoQ…"):
     qoq = load_qoq(selected_fy, rate_col, dim_cache_key)
 
 if not qoq.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="qoq_view", label_visibility="collapsed")
     if view == "Table":
         total = qoq["net_collections"].sum()
         grand = pd.DataFrame([{"quarter": "Grand Total", "net_collections": total}])
         qoq_d = pd.concat([qoq, grand], ignore_index=True)
         qoq_d["row_pct"] = qoq_d["net_collections"] / total if total else 0
-        qoq_d["net_collections"] = qoq_d["net_collections"].apply(lambda x: fmt(x, currency))
+        qoq_d["net_collections"] = qoq_d["net_collections"].apply(lambda x: fmt(x, currency, raw=raw_values))
         qoq_d["row_pct"]         = qoq_d["row_pct"].apply(fmt_pct)
         qoq_d.columns = ["Quarter", "Collections", "Row %"]
         st.dataframe(qoq_d, width='stretch', hide_index=True)
     else:
         render_line_chart(qoq, "quarter", ["net_collections"],
-                         f"QoQ Collections — {selected_fy}", currency)
+                         f"QoQ Collections — {selected_fy}", currency, raw=raw_values)
 
 st.divider()
 
@@ -278,21 +274,21 @@ with st.spinner("Loading entity split…"):
     ent = load_by_entity(selected_fy, rate_col, dim_cache_key)
 
 if not ent.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="entity_view", label_visibility="collapsed")
     total_ent = ent["amount"].sum()
     grand_ent = pd.DataFrame([{"subsidiary_name": "Grand Total", "amount": total_ent}])
     ent_d = pd.concat([ent, grand_ent], ignore_index=True)
     ent_d["row_pct"] = ent_d["amount"] / total_ent if total_ent else 0
     ent_d["row_pct"] = ent_d["row_pct"].apply(fmt_pct)
-    ent_d["amount"]  = ent_d["amount"].apply(lambda x: fmt(x, currency))
+    ent_d["amount"]  = ent_d["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
     ent_d.columns    = ["Billing Entity", "Amount", "Row %"]
     if view == "Table":
         st.dataframe(ent_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(ent, "subsidiary_name", "amount",
                          f"Collections by Entity — {selected_fy}",
-                         currency, horizontal=False, height=300)
+                         currency, horizontal=False, height=300, raw=raw_values)
 
 st.divider()
 
@@ -318,21 +314,21 @@ with st.spinner("Loading currency split…"):
     cur = load_by_currency(selected_fy, rate_col, dim_cache_key)
 
 if not cur.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="currency_view", label_visibility="collapsed")
     total_cur = cur["amount"].sum()
     grand_cur = pd.DataFrame([{"currency_symbol": "Grand Total", "amount": total_cur}])
     cur_d = pd.concat([cur, grand_cur], ignore_index=True)
     cur_d["row_pct"] = cur_d["amount"] / total_cur if total_cur else 0
     cur_d["row_pct"] = cur_d["row_pct"].apply(fmt_pct)
-    cur_d["amount"]  = cur_d["amount"].apply(lambda x: fmt(x, currency))
+    cur_d["amount"]  = cur_d["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
     cur_d.columns    = ["Currency", "Amount", "Row %"]
     if view == "Table":
         st.dataframe(cur_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(cur, "currency_symbol", "amount",
                          f"Collections by Currency — {selected_fy}",
-                         currency, horizontal=False, height=300)
+                         currency, horizontal=False, height=300, raw=raw_values)
 
 st.divider()
 
@@ -358,21 +354,21 @@ with st.spinner("Loading region split…"):
     reg = load_by_region(selected_fy, rate_col, dim_cache_key)
 
 if not reg.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="region_view", label_visibility="collapsed")
     total_reg = reg["amount"].sum()
     grand_reg = pd.DataFrame([{"region": "Grand Total", "amount": total_reg}])
     reg_d = pd.concat([reg, grand_reg], ignore_index=True)
     reg_d["row_pct"] = reg_d["amount"] / total_reg if total_reg else 0
     reg_d["row_pct"] = reg_d["row_pct"].apply(fmt_pct)
-    reg_d["amount"]  = reg_d["amount"].apply(lambda x: fmt(x, currency))
+    reg_d["amount"]  = reg_d["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
     reg_d.columns    = ["Region", "Amount", "Row %"]
     if view == "Table":
         st.dataframe(reg_d, width='stretch', hide_index=True)
     else:
         render_bar_chart(reg, "region", "amount",
                          f"Collections by Region — {selected_fy}",
-                         currency, horizontal=False, height=350)
+                         currency, horizontal=False, height=350, raw=raw_values)
 
 st.divider()
 
@@ -406,7 +402,7 @@ if not cust.empty:
         cust_d = cust.copy()
         cust_d["row_pct"] = cust_d["amount"] / total_cust if total_cust else 0
         cust_d["row_pct"] = cust_d["row_pct"].apply(fmt_pct)
-        cust_d["amount"]  = cust_d["amount"].apply(lambda x: fmt(x, currency))
+        cust_d["amount"]  = cust_d["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
         cust_d.columns    = ["Customer", "Amount", "Row %"]
         st.dataframe(cust_d, width='stretch', hide_index=True)
     with tab_c:
@@ -457,7 +453,7 @@ if not ic.empty:
     pivot_disp = pivot.copy()
     pivot_disp["Row %"] = pivot_disp["Row %"].apply(fmt_pct)
     for c in recv_cols + ["Row Total"]:
-        pivot_disp[c] = pivot_disp[c].apply(lambda x: fmt(x, currency))
+        pivot_disp[c] = pivot_disp[c].apply(lambda x: fmt(x, currency, raw=raw_values))
     pivot_disp = pivot_disp.rename(
         columns={"paying_entity": "Paying Entity ↓ / Receiving Entity →"}
     )
@@ -514,8 +510,8 @@ if not age.empty:
         total = row["Row Total"]
         amount_row = {"Financial Quarter": row["quarter"]}
         for b in existing_buckets:
-            amount_row[b] = fmt(row[b], currency)
-        amount_row["Row Total"] = fmt(total, currency)
+            amount_row[b] = fmt(row[b], currency, raw=raw_values)
+        amount_row["Row Total"] = fmt(total, currency, raw=raw_values)
         amount_row["Row %"] = fmt_pct(total / age_pivot.iloc[:-1]["Row Total"].sum()
                                       if age_pivot.iloc[:-1]["Row Total"].sum() and
                                       row["quarter"] != "Grand Total" else

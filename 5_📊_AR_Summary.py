@@ -49,31 +49,10 @@ with st.spinner("Loading filters…"):
 # ─────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("Filters")
+    st.header("Settings")
     currency = st.radio("Currency", ["USD", "INR"], horizontal=True)
+    raw_values = st.toggle("Show raw values", value=False)
     rate_col = "usd_exchangerate" if currency == "USD" else "inr_exchangerate"
-
-    st.divider()
-    st.subheader("Dimensions")
-
-    sel_region = st.multiselect(
-        "Region", opts["region"], placeholder="All regions"
-    )
-    sel_entity = st.multiselect(
-        "Billing Entity", opts["subsidiary_name"], placeholder="All entities"
-    )
-    sel_cjs = st.multiselect(
-        "Client Journey Stage", opts["client_journey_stage"], placeholder="All stages"
-    )
-    sel_bucket = st.multiselect(
-        "Client Bucket", opts["client_buckets"], placeholder="All buckets"
-    )
-    sel_status = st.multiselect(
-        "Collection Status", opts["collection_status"], placeholder="All statuses"
-    )
-    sel_currency = st.multiselect(
-        "Transaction Currency", opts["currency_symbol"], placeholder="All currencies"
-    )
 
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
@@ -103,19 +82,36 @@ def build_where():
     return "WHERE " + "\n  AND ".join(clauses)
 
 
+# ─────────────────────────────────────────────
+# PAGE HEADER + DIMENSION FILTERS
+# ─────────────────────────────────────────────
+
+st.title("📊 AR Aging Summary")
+st.caption(f"Real-time snapshot · As of {date.today().strftime('%d %b %Y')} · "
+           f"External customers only · {currency}")
+
+with st.expander("🔽 Filters", expanded=True):
+    r1c1, r1c2, r1c3 = st.columns(3)
+    r2c1, r2c2, r2c3 = st.columns(3)
+    with r1c1:
+        sel_region   = st.multiselect("Region", opts["region"], placeholder="All regions")
+    with r1c2:
+        sel_entity   = st.multiselect("Billing Entity", opts["subsidiary_name"], placeholder="All entities")
+    with r1c3:
+        sel_cjs      = st.multiselect("Client Journey Stage", opts["client_journey_stage"], placeholder="All stages")
+    with r2c1:
+        sel_bucket   = st.multiselect("Client Bucket", opts["client_buckets"], placeholder="All buckets")
+    with r2c2:
+        sel_status   = st.multiselect("Collection Status", opts["collection_status"], placeholder="All statuses")
+    with r2c3:
+        sel_currency = st.multiselect("Transaction Currency", opts["currency_symbol"], placeholder="All currencies")
+
 dim_cache_key = (
     currency,
     tuple(sel_region), tuple(sel_entity), tuple(sel_cjs),
     tuple(sel_bucket), tuple(sel_status), tuple(sel_currency)
 )
 
-# ─────────────────────────────────────────────
-# PAGE HEADER
-# ─────────────────────────────────────────────
-
-st.title("📊 AR Aging Summary")
-st.caption(f"Real-time snapshot · As of {date.today().strftime('%d %b %Y')} · "
-           f"External customers only · {currency}")
 st.divider()
 
 # ─────────────────────────────────────────────
@@ -149,10 +145,10 @@ with st.spinner("Loading totals…"):
 c1, c2 = st.columns(2)
 with c1:
     render_kpi_card("Total Outstanding", totals["total_outstanding"],
-                    currency=currency, vs_label="")
+                    currency=currency, vs_label="", raw=raw_values)
 with c2:
     render_kpi_card("Total Overdue", totals["total_overdue"],
-                    currency=currency, vs_label="")
+                    currency=currency, vs_label="", raw=raw_values)
 
 st.markdown("")
 
@@ -171,7 +167,7 @@ for i, (label, _) in enumerate(AR_AGEING_BUCKETS):
                         text-transform:uppercase;letter-spacing:0.04em;
                         margin-bottom:4px;">{label}</div>
             <div style="font-size:18px;font-weight:700;color:#111827;
-                        margin-bottom:2px;">{fmt(val, currency)}</div>
+                        margin-bottom:2px;">{fmt(val, currency, raw=raw_values)}</div>
             <div style="font-size:12px;color:#6b7280;">{fmt_pct(pct)}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -183,8 +179,8 @@ st.divider()
 # ─────────────────────────────────────────────
 
 search = st.text_input(
-    "🔍 Search customer", placeholder="Type company name…",
-    help="Filters the aging table below"
+    "🔍 Search customer", placeholder="Company name, UCC, or Entity ID…",
+    help="Filters the aging table below by company name, UCC, or entity ID"
 )
 
 # ─────────────────────────────────────────────
@@ -201,7 +197,8 @@ def load_aging_detail(rate, dim_key):
     ])
     return run_query(f"""
         SELECT
-            customer_ucc                                                        AS entity_id,
+            customer_ucc,
+            entity_id,
             customer_name,
             client_buckets,
             collection_status,
@@ -212,7 +209,7 @@ def load_aging_detail(rate, dim_key):
         FROM ar
         {build_where()}
           AND customer_name IS NOT NULL
-        GROUP BY customer_ucc, customer_name, client_buckets,
+        GROUP BY customer_ucc, entity_id, customer_name, client_buckets,
                  collection_status, client_journey_stage
         ORDER BY total_outstanding DESC
     """)
@@ -223,15 +220,18 @@ with st.spinner("Loading customer aging detail…"):
 if not detail.empty:
     # Apply search filter
     if search:
+        s = search.lower()
         detail = detail[
-            detail["customer_name"].str.contains(search, case=False, na=False)
+            detail["customer_name"].fillna("").str.lower().str.contains(s, regex=False) |
+            detail["customer_ucc"].fillna("").str.lower().str.contains(s, regex=False) |
+            detail["entity_id"].fillna("").str.lower().str.contains(s, regex=False)
         ]
 
     total_rows = len(detail)
     st.caption(f"{total_rows:,} customers")
 
     # Build grand total row
-    grand = {"entity_id": "", "customer_name": "Grand Total",
+    grand = {"customer_ucc": "", "entity_id": "", "customer_name": "Grand Total",
              "client_buckets": "", "collection_status": "",
              "client_journey_stage": ""}
     for col in ["total_outstanding", "total_overdue"] + [f"bucket_{i}" for i in range(len(AR_AGEING_BUCKETS))]:
@@ -242,17 +242,18 @@ if not detail.empty:
     # Format all amount columns
     for i in range(len(AR_AGEING_BUCKETS)):
         display_df[f"bucket_{i}"] = display_df[f"bucket_{i}"].apply(
-            lambda x: fmt(x, currency) if pd.notnull(x) and x != "" else ""
+            lambda x: fmt(x, currency, raw=raw_values) if pd.notnull(x) and x != "" else ""
         )
     display_df["total_outstanding"] = display_df["total_outstanding"].apply(
-        lambda x: fmt(x, currency) if pd.notnull(x) and x != "" else ""
+        lambda x: fmt(x, currency, raw=raw_values) if pd.notnull(x) and x != "" else ""
     )
     display_df["total_overdue"] = display_df["total_overdue"].apply(
-        lambda x: fmt(x, currency) if pd.notnull(x) and x != "" else ""
+        lambda x: fmt(x, currency, raw=raw_values) if pd.notnull(x) and x != "" else ""
     )
 
     # Rename columns
     rename_map = {
+        "customer_ucc":         "UCC",
         "entity_id":            "Entity ID",
         "customer_name":        "Company Name",
         "client_buckets":       "Client Bucket",
@@ -268,7 +269,7 @@ if not detail.empty:
 
     # Column order: identity → dimensions → buckets → totals
     col_order = (
-        ["Entity ID", "Company Name", "Client Bucket",
+        ["UCC", "Entity ID", "Company Name", "Client Bucket",
          "Collection Status", "Customer Journey"]
         + [label for label, _ in AR_AGEING_BUCKETS]
         + ["Total Outstanding", "Total Overdue"]

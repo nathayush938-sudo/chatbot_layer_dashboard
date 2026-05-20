@@ -53,46 +53,14 @@ with st.spinner("Loading filters…"):
 with st.sidebar:
     st.header("Filters")
 
-    selected_fy = st.selectbox(
-        "Financial Year",
-        options=[CUR_FY, PREV_FY, fy["two_years_ago_fy"]],
-        index=0,
-    )
     currency = st.radio("Currency", ["USD", "INR"], horizontal=True)
+    raw_values = st.toggle("Show raw values", value=False)
     rate_col = "usd_exchangerate" if currency == "USD" else "inr_exchangerate"
-
-    st.divider()
-    st.subheader("Dimensions")
-
-    sel_region = st.multiselect(
-        "Region", opts["region"], placeholder="All regions"
-    )
-    sel_entity = st.multiselect(
-        "Billing Entity", opts["subsidiary_name"], placeholder="All entities"
-    )
-    sel_cjs = st.multiselect(
-        "Client Journey Stage", opts["client_journey_stage"], placeholder="All stages"
-    )
-    sel_bucket = st.multiselect(
-        "Client Bucket", opts["client_buckets"], placeholder="All buckets"
-    )
-    sel_status = st.multiselect(
-        "Collection Status", opts["collection_status"], placeholder="All statuses"
-    )
-    sel_txn_type = st.multiselect(
-        "Transaction Type", opts["transaction_type"], placeholder="All types"
-    )
-    sel_currency = st.multiselect(
-        "Transaction Currency", opts["currency_symbol"], placeholder="All currencies"
-    )
 
     st.divider()
     if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
-PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
-
 
 # ─────────────────────────────────────────────
 # WHERE CLAUSE BUILDER
@@ -139,9 +107,41 @@ def _add_dim_clauses(clauses: list):
     in_clause("transaction_type",     sel_txn_type)
     in_clause("currency_symbol",      sel_currency)
 
+selected_fy = st.session_state.get("billing_fy", CUR_FY)
+PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
+
 st.title(f"📋 Billing Dashboard — {selected_fy}")
 st.caption(f"External customers only · {currency} · Compared vs {PREV}")
 st.divider()
+
+with st.expander("🔽 Filters", expanded=True):
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    with r1c1:
+        selected_fy  = st.selectbox("Financial Year", options=[CUR_FY, PREV_FY, fy["two_years_ago_fy"]], index=0, key="billing_fy")
+    with r1c2:
+        sel_region   = st.multiselect("Region", opts["region"], placeholder="All regions")
+    with r1c3:
+        sel_entity   = st.multiselect("Billing Entity", opts["subsidiary_name"], placeholder="All entities")
+    with r1c4:
+        sel_cjs      = st.multiselect("Client Journey Stage", opts["client_journey_stage"], placeholder="All stages")
+    with r2c1:
+        sel_bucket   = st.multiselect("Client Bucket", opts["client_buckets"], placeholder="All buckets")
+    with r2c2:
+        sel_status   = st.multiselect("Collection Status", opts["collection_status"], placeholder="All statuses")
+    with r2c3:
+        sel_txn_type = st.multiselect("Transaction Type", opts["transaction_type"], placeholder="All types")
+    with r2c4:
+        sel_currency = st.multiselect("Transaction Currency", opts["currency_symbol"], placeholder="All currencies")
+
+# Build a hashable key from current dimension selections for cache busting
+dim_cache_key = (
+    tuple(sel_region), tuple(sel_entity), tuple(sel_cjs),
+    tuple(sel_bucket), tuple(sel_status), tuple(sel_txn_type), tuple(sel_currency)
+)
+
+PREV = PREV_FY if selected_fy == CUR_FY else fy["two_years_ago_fy"]
+
 
 
 # ─────────────────────────────────────────────
@@ -168,12 +168,6 @@ def load_kpis(fy_filter, prev_filter, rate, dim_key):
     """
     return run_query(sql).iloc[0]
 
-# Build a hashable key from current dimension selections for cache busting
-dim_cache_key = (
-    tuple(sel_region), tuple(sel_entity), tuple(sel_cjs),
-    tuple(sel_bucket), tuple(sel_status), tuple(sel_txn_type), tuple(sel_currency)
-)
-
 with st.spinner("Loading KPIs…"):
     kpi = load_kpis(selected_fy, PREV, rate_col, dim_cache_key)
 
@@ -188,7 +182,7 @@ with c3:
     render_kpi_card("Tax Amount",
                     kpi["ytd_incl"] - kpi["ytd_excl"] if kpi["ytd_incl"] else 0,
                     kpi["prev_incl"] - kpi["prev_excl"] if kpi["prev_incl"] else 0,
-                    currency)
+                    currency, raw=raw_values)
 
 st.divider()
 
@@ -214,7 +208,7 @@ with st.spinner("Loading QoQ…"):
 
 st.subheader(f"QoQ Billing — {selected_fy}")
 if not qoq.empty:
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="qoq_view", label_visibility="collapsed")
     if view == "Table":
         qoq_display = qoq.copy()
@@ -227,15 +221,15 @@ if not qoq.empty:
         }])
         qoq_display = pd.concat([qoq_display, grand], ignore_index=True)
         qoq_display["pct_of_total"] = qoq_display["billed_incl"] / total_incl if total_incl else 0
-        qoq_display["billed_incl"]  = qoq_display["billed_incl"].apply(lambda x: fmt(x, currency))
+        qoq_display["billed_incl"]  = qoq_display["billed_incl"].apply(lambda x: fmt(x, currency, raw=raw_values))
         qoq_display["pct_of_total"] = qoq_display["pct_of_total"].apply(fmt_pct)
-        qoq_display["billed_excl"]  = qoq_display["billed_excl"].apply(lambda x: fmt(x, currency))
+        qoq_display["billed_excl"]  = qoq_display["billed_excl"].apply(lambda x: fmt(x, currency, raw=raw_values))
         qoq_display = qoq_display[["quarter", "billed_incl", "pct_of_total", "billed_excl"]]
         qoq_display.columns = ["Quarter", "Billed (Incl Tax)", "Incl Tax %", "Billed (Excl Tax)"]
         st.dataframe(qoq_display, width='stretch', hide_index=True)
     else:
         render_line_chart(qoq, "quarter", ["billed_incl", "billed_excl"],
-                         f"QoQ Billing — {selected_fy}", currency)
+                         f"QoQ Billing — {selected_fy}", currency, raw=raw_values)
 
 st.divider()
 
@@ -275,7 +269,7 @@ if not ts_raw.empty:
     ts_df  = pd.DataFrame([
         {
             "Invoice Type": labels[k],
-            "Amount":       fmt(row[k], currency),
+            "Amount":       fmt(row[k], currency, raw=raw_values),
             "Row %":        fmt_pct(row[k] / total) if total else "—",
             "_sort":        row[k],
         }
@@ -284,23 +278,23 @@ if not ts_raw.empty:
 
     grand  = pd.DataFrame([{
         "Invoice Type": "Grand Total",
-        "Amount": fmt(total, currency),
+        "Amount": fmt(total, currency, raw=raw_values),
         "Row %": "100.0%",
     }])
     ts_df  = pd.concat([ts_df, grand], ignore_index=True)
 
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="type_split_view", label_visibility="collapsed")
     if view == "Table":
         st.dataframe(ts_df, width='stretch', hide_index=True)
     else:
         bar_df = pd.DataFrame([
             {"Type": labels[k], "Amount": float(row[k])}
-            for k in labels if k != "tax_amount" and pd.notnull(row[k])
+            for k in labels if pd.notnull(row[k]) and float(row[k]) != 0
         ]).sort_values("Amount", ascending=True)
         render_bar_chart(bar_df, "Type", "Amount",
                          f"Revenue Type Split — {selected_fy}",
-                         currency, horizontal=True, height=300)
+                         currency, horizontal=True, height=300, raw=raw_values)
 
 st.divider()
 
@@ -331,18 +325,18 @@ if not ent.empty:
     grand_ent = pd.DataFrame([{"subsidiary_name": "Grand Total",
                                 "amount": total_ent, "row_pct": 1.0}])
     ent_disp  = pd.concat([ent_disp, grand_ent], ignore_index=True)
-    ent_disp["amount"]  = ent_disp["amount"].apply(lambda x: fmt(x, currency))
+    ent_disp["amount"]  = ent_disp["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
     ent_disp["row_pct"] = ent_disp["row_pct"].apply(fmt_pct)
     ent_disp.columns    = ["Billing Entity", "Amount", "Row %"]
 
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="entity_view", label_visibility="collapsed")
     if view == "Table":
         st.dataframe(ent_disp, width='stretch', hide_index=True)
     else:
         render_bar_chart(ent, "subsidiary_name", "amount",
                          f"Billing by Entity — {selected_fy}",
-                         currency, horizontal=False, height=300)
+                         currency, horizontal=False, height=300, raw=raw_values)
 
 st.divider()
 
@@ -373,18 +367,18 @@ if not reg.empty:
     grand_reg = pd.DataFrame([{"region": "Grand Total",
                                 "amount": total_reg, "row_pct": 1.0}])
     reg_disp  = pd.concat([reg_disp, grand_reg], ignore_index=True)
-    reg_disp["amount"]  = reg_disp["amount"].apply(lambda x: fmt(x, currency))
+    reg_disp["amount"]  = reg_disp["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
     reg_disp["row_pct"] = reg_disp["row_pct"].apply(fmt_pct)
     reg_disp.columns    = ["Region", "Amount", "Row %"]
 
-    view = st.radio("", ["Table", "Chart"], horizontal=True,
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
                     key="region_view", label_visibility="collapsed")
     if view == "Table":
         st.dataframe(reg_disp, width='stretch', hide_index=True)
     else:
         render_bar_chart(reg, "region", "amount",
                          f"Billing by Region — {selected_fy}",
-                         currency, horizontal=False, height=300)
+                         currency, horizontal=False, height=300, raw=raw_values)
 
 st.divider()
 
@@ -439,7 +433,7 @@ if not etp.empty:
         "total":           "Total",
     }
     for col in metric_cols:
-        etp_disp[col] = etp_disp[col].apply(lambda x: fmt(x, currency))
+        etp_disp[col] = etp_disp[col].apply(lambda x: fmt(x, currency, raw=raw_values))
     etp_disp["row_pct"] = etp_disp["row_pct"].apply(fmt_pct)
     etp_disp = etp_disp.rename(columns=col_rename)
     # Reorder so % of Total is after Total
@@ -500,7 +494,7 @@ if not qtp.empty:
         "total":          "Total",
     }
     for col in metric_cols:
-        qtp_disp[col] = qtp_disp[col].apply(lambda x: fmt(x, currency))
+        qtp_disp[col] = qtp_disp[col].apply(lambda x: fmt(x, currency, raw=raw_values))
     qtp_disp["row_pct"] = qtp_disp["row_pct"].apply(fmt_pct)
     qtp_disp = qtp_disp.rename(columns=col_rename)
     cols = [c for c in qtp_disp.columns if c not in ["% of Total"]] + ["% of Total"]
@@ -560,7 +554,7 @@ if not rtp.empty:
         "total":          "Total",
     }
     for col in metric_cols:
-        rtp_disp[col] = rtp_disp[col].apply(lambda x: fmt(x, currency))
+        rtp_disp[col] = rtp_disp[col].apply(lambda x: fmt(x, currency, raw=raw_values))
     rtp_disp["row_pct"] = rtp_disp["row_pct"].apply(fmt_pct)
     rtp_disp = rtp_disp.rename(columns=col_rename)
     cols = [c for c in rtp_disp.columns if c not in ["% of Total"]] + ["% of Total"]
@@ -621,7 +615,7 @@ if not cm.empty:
 
     for col in quarters + ["total"]:
         if col in cm_disp.columns:
-            cm_disp[col] = cm_disp[col].apply(lambda x: fmt(x, currency))
+            cm_disp[col] = cm_disp[col].apply(lambda x: fmt(x, currency, raw=raw_values))
     cm_disp["row_pct"] = cm_disp["row_pct"].apply(fmt_pct)
     cm_disp = cm_disp.rename(columns={"currency_symbol": "Currency",
                                        "row_pct": "% of Total", "total": "Total"})
@@ -660,7 +654,7 @@ if not cust.empty:
         total_cust = cust["amount"].sum()
         cust_disp  = cust.copy()
         cust_disp["row_pct"] = cust_disp["amount"] / total_cust if total_cust else 0
-        cust_disp["amount"]  = cust_disp["amount"].apply(lambda x: fmt(x, currency))
+        cust_disp["amount"]  = cust_disp["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
         cust_disp["row_pct"] = cust_disp["row_pct"].apply(fmt_pct)
         cust_disp.columns    = ["Customer", "Amount", "Row %"]
         st.dataframe(cust_disp, width='stretch', hide_index=True)
@@ -668,8 +662,7 @@ if not cust.empty:
     with tab_c:
         render_bar_chart(cust, "customer_name", "amount",
                          f"Top 20 Customers — {selected_fy}",
-                         currency, horizontal=True,
-                         height=max(400, len(cust) * 28))
+                         currency, horizontal=True, raw=raw_values)
 
 st.divider()
 
@@ -710,8 +703,50 @@ if not ic.empty:
 
     pivot_disp = pivot.copy()
     for c in paying_cols + ["Total"]:
-        pivot_disp[c] = pivot_disp[c].apply(lambda x: fmt(x, currency))
+        pivot_disp[c] = pivot_disp[c].apply(lambda x: fmt(x, currency, raw=raw_values))
     pivot_disp = pivot_disp.rename(columns={"subsidiary_name": "Billing Entity ↓ / Paying Entity →"})
     st.dataframe(pivot_disp, width='stretch', hide_index=True)
 else:
     st.info("No intercompany billing data for this period.")
+
+st.divider()
+
+# ── QoQ Intercompany Billing ──────────────────────────────────────────────
+
+st.subheader("QoQ Intercompany Billing")
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_ic_qoq(fy_filter, rate, dim_key):
+    return run_query(f"""
+        SELECT
+            transaction_fy_quarter AS quarter,
+            SUM(billing_amount * {rate}) AS amount
+        FROM billing
+        {build_where(fy_filter, include_ic=True)}
+        GROUP BY quarter
+        ORDER BY quarter
+    """)
+
+with st.spinner("Loading IC QoQ…"):
+    ic_qoq = load_ic_qoq(selected_fy, rate_col, dim_cache_key)
+
+if not ic_qoq.empty:
+    view = st.radio("View", ["Table", "Chart"], horizontal=True,
+                    key="ic_qoq_view", label_visibility="collapsed")
+
+    total_ic = ic_qoq["amount"].sum()
+    grand_ic = pd.DataFrame([{"quarter": "Grand Total", "amount": total_ic}])
+    ic_disp  = pd.concat([ic_qoq, grand_ic], ignore_index=True)
+    ic_disp["row_pct"] = ic_disp["amount"] / total_ic if total_ic else 0
+    ic_disp["amount"]  = ic_disp["amount"].apply(lambda x: fmt(x, currency, raw=raw_values))
+    ic_disp["row_pct"] = ic_disp["row_pct"].apply(fmt_pct)
+    ic_disp.columns    = ["Quarter", "Amount", "Row %"]
+
+    if view == "Table":
+        st.dataframe(ic_disp, width='stretch', hide_index=True)
+    else:
+        render_bar_chart(ic_qoq, "quarter", "amount",
+                         f"QoQ Intercompany Billing — {selected_fy}",
+                         currency, horizontal=False, height=300, raw=raw_values)
+else:
+    st.info("No intercompany QoQ data for this period.")
